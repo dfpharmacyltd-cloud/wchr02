@@ -10,6 +10,9 @@ Candidate Excel → change detection → status template → Outlook → email s
 | `redirect.html` | Blank page Microsoft sign-in returns to. Keep it next to `index.html` |
 | `xlsx.full.min.js` | Excel reader, served from your own site so office firewalls can't block it |
 | `msal-browser.min.js` | Microsoft sign-in library, served from your own site |
+| `supabase.min.js` | Shared-database library, served from your own site |
+| `config.js` | Your Supabase project URL and public key (shared data on every computer) |
+| `supabase_setup.sql` | Run once in Supabase to create the shared tables (not uploaded to the site) |
 | `Sample_1_start.xlsx` | Three test candidates in the bio-data list format |
 | `Sample_2_update.xlsx` | Same people with status and interview changes, plus one new applicant |
 
@@ -42,6 +45,18 @@ No client secret is created or needed. The app uses the OAuth 2.0 authorization-
 
 Tip: leave Simulation mode on first and run the two sample files through the full flow. Addresses containing `fail` simulate a failed send so you can see the retry path.
 
+## Shared data on every computer (Supabase)
+
+1. Go to **supabase.com** → **New project** (name `westcoast-recruitment`, region Mumbai, any strong database password).
+2. **SQL Editor → New query** → paste all of `supabase_setup.sql` → **Run**.
+3. **Authentication → Sign In / Providers** → turn **off** "Allow new users to sign up".
+4. **Authentication → Users → Add user → Create new user**: one email + password per HR person, tick **Auto Confirm User**.
+5. **Project Settings → API**: copy the **Project URL** and the **anon public** key into `config.js`, then upload `config.js` with the other files to GitHub.
+6. On the computer that already has the data: open the app and sign in. Its data is uploaded automatically.
+7. On every other computer: open the app and sign in. The same data appears.
+
+The anon key is designed to be public; the database only answers to signed-in HR users (row-level security in the SQL file).
+
 ## Your file format (bio-data list)
 
 The export works exactly as it comes, .csv or .xlsx:
@@ -65,7 +80,8 @@ The export works exactly as it comes, .csv or .xlsx:
 
 ## Things to know
 
-- **Data lives in the browser** (IndexedDB) on the computer where the app is used. Use one HR computer and one browser profile, and use **Settings → Download backup** weekly. Other computers see their own separate data.
+- **Shared data**: with `config.js` filled in, all data lives in Supabase and every HR computer sees the same candidates, templates and email log after signing in. Without it, data stays in one browser only.
+- **One sending computer**: only one computer sends at a time (the first open one with Outlook connected). Others can upload, change statuses and approve; their emails are sent by the sending computer. If it closes, another open computer with Outlook connected takes over within 2 minutes. **Settings → Shared data → Send emails from this computer** switches it by hand.
 - **Interview reminders** are sent by the open page. Keep the app open in a browser tab on the HR computer; if it was closed at the due time, overdue reminders go out when it next opens (if the interview hasn't happened).
 - **Roles** are enforced in the app for whoever is signed in to Outlook in that browser. They stop accidental changes; they are not a server-side security boundary.
 - **Attachments**: up to 3 MB total per email (Microsoft Graph limit for this sending method). Share larger files via a link.

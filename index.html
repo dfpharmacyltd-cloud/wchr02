@@ -12,6 +12,9 @@
 <script src="xlsx.full.min.js"></script>
 <script>if(!window.XLSX)document.write('<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"><\/script>');</script>
 <script>if(!window.XLSX)document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"><\/script>');</script>
+<script src="config.js"></script>
+<script src="supabase.min.js"></script>
+<script>if(!window.supabase)document.write('<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"><\/script>');</script>
 <script src="msal-browser.min.js"></script>
 <script>if(!window.msal)document.write('<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"><\/script>');</script>
 <style>
@@ -195,6 +198,11 @@ iframe.mail{width:100%;height:460px;border:1px solid var(--line);border-radius:6
 .toast{background:var(--ink);color:#fff;padding:10px 14px;border-radius:6px;font-size:13.5px;box-shadow:0 6px 20px rgba(0,0,0,.2)}
 .toast.err{background:var(--err)}.toast.ok{background:var(--ok)}
 .hide{display:none!important}
+.gate{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;padding:20px;z-index:300}
+.gate-card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:28px;width:100%;max-width:400px}
+.gate-card img{width:200px;display:block;margin-bottom:18px}
+.gate-card h2{margin-bottom:6px}
+.chip.sync-ok{background:var(--okbg);color:var(--ok)}.chip.sync-saving{background:var(--infobg);color:var(--info)}.chip.sync-error{background:var(--errbg);color:var(--err)}
 .mode-opt{display:flex;gap:12px;align-items:flex-start;padding:14px;border:1px solid var(--line);border-radius:var(--r);cursor:pointer;margin-bottom:10px}
 .mode-opt.on{border-color:var(--navy);background:#F4F3FB}
 .mode-opt input{margin-top:4px;accent-color:var(--navy)}
@@ -331,6 +339,9 @@ function defaultTemplates(){
 async function loadState(){
   await DB.open();
   for (const k of KEYS) S[k] = await DB.get(k);
+  await applyDefaults();
+}
+async function applyDefaults(){
   S.settings = Object.assign({
     companyName: "West-Coast Pharmaceutical Works Ltd.", logo: LOGO_DEFAULT,
     address: "Chattral-Vadaswami Road, Village: Vadaswami, Dist.: Kalol, Gujarat",
@@ -340,8 +351,9 @@ async function loadState(){
     reminderEnabled: true, reminderDays: 1, reminderTime: "09:00",
     batchEnabled: true, batchSize: 200, batchMinutes: 5, dailyCap: 10000, queuePaused: false, nextBatchAt: 0,
     defaultStatus: "Application Received", interviewVenue: "West-Coast Pharmaceutical Works Ltd., Chattral-Vadaswami Road, Village: Vadaswami, Dist.: Kalol, Gujarat",
-    connectedEmail: "", connectedName: ""
   }, S.settings || {});
+  // Outlook connection details belong to each computer, not to the shared data
+  ["connectedEmail","connectedName","mailboxEmail"].forEach(k => { if (S.settings[k] && !PC[k]) PC[k] = S.settings[k]; delete S.settings[k]; }); savePC();
   if (!S.templates) S.templates = defaultTemplates();
   if (!S.statuses) S.statuses = DEFAULT_STATUSES.map(n => ({ name: n, templateId: "tpl_" + slug(n), active: true }));
   S.files = S.files || {}; S.candidates = S.candidates || {}; S.columns = S.columns || [...DEFAULT_COLS];
@@ -367,12 +379,174 @@ async function loadState(){
   // Anything left "Processing" by a closed tab goes back to the queue
   S.log.forEach(e => { if (e.emailStatus === "Processing"){ if (e.queuedAt){ e.emailStatus = "Queued"; e.error = ""; } else { e.emailStatus = "Failed"; e.error = "Sending was interrupted (the browser tab closed). Use Retry."; } } });
 }
-function save(...ks){ return Promise.all(ks.map(k => DB.set(k, S[k]))).catch(e => toast("Could not save data in this browser: " + e.message, "err")); }
+/* ---------- shared database (Supabase): every HR computer sees the same data ---------- */
+const CFG = window.WC_CONFIG || {};
+const PC = (() => { try { return JSON.parse(localStorage.getItem("wc_pc") || "{}"); } catch { return {}; } })();
+if (!PC.id) PC.id = "pc_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+function savePC(){ try { localStorage.setItem("wc_pc", JSON.stringify(PC)); } catch {} }
+savePC();
+const TABLES = { candidates: "wc_candidates", log: "wc_email_log" };
+const CLOUD = { on: false, sb: null, user: null, synced: { candidates: new Map(), log: new Map() }, kv: {}, lastPull: null, pushing: false, pulling: false, pending: new Set(), timer: null, state: "ok", err: "", lock: null };
+const cloudConfigured = () => !!(CFG.supabaseUrl && CFG.supabaseAnonKey && window.supabase);
+const myEmail = () => ((CLOUD.on && CLOUD.user && CLOUD.user.email) || PC.connectedEmail || "").toLowerCase();
+
+function save(...ks){
+  if (CLOUD.on){ ks.forEach(k => CLOUD.pending.add(k)); clearTimeout(CLOUD.timer); CLOUD.timer = setTimeout(cloudPush, 700); return Promise.resolve(); }
+  return Promise.all(ks.map(k => DB.set(k, S[k]))).catch(e => toast("Could not save data in this browser: " + e.message, "err"));
+}
+async function persistAll(){
+  if (CLOUD.on){ KEYS.forEach(k => CLOUD.pending.add(k)); clearTimeout(CLOUD.timer); await cloudPush(); if (CLOUD.pending.size) throw new Error(CLOUD.err || "could not reach the shared database"); }
+  else for (const k of KEYS) await DB.set(k, S[k]);
+}
+function setSync(state, err){ CLOUD.state = state; CLOUD.err = err || ""; if ($("#topMeta")) renderTop(); }
+async function cloudPush(){
+  if (!CLOUD.on) return;
+  if (CLOUD.pushing || CLOUD.pulling){ clearTimeout(CLOUD.timer); CLOUD.timer = setTimeout(cloudPush, 800); return; }
+  const keys = [...CLOUD.pending]; CLOUD.pending.clear(); if (!keys.length) return;
+  CLOUD.pushing = true; setSync("saving");
+  try {
+    for (const k of keys){ if (TABLES[k]) await pushTable(k); else await pushKv(k); }
+    setSync(CLOUD.pending.size ? "saving" : "ok");
+  } catch (e){
+    keys.forEach(k => CLOUD.pending.add(k)); setSync("error", e.message || String(e));
+    clearTimeout(CLOUD.timer); CLOUD.timer = setTimeout(cloudPush, 15000);
+  } finally { CLOUD.pushing = false; }
+}
+async function pushKv(k){
+  const str = JSON.stringify(S[k] ?? null);
+  if (CLOUD.kv[k] === str) return;
+  const { error } = await CLOUD.sb.from("wc_kv").upsert({ key: k, value: S[k] ?? null });
+  if (error) throw error;
+  CLOUD.kv[k] = str;
+}
+function tableEntries(k){ return k === "candidates" ? Object.entries(S.candidates) : S.log.map(e => [e.id, e]); }
+async function pushTable(k){
+  const synced = CLOUD.synced[k], rows = [], strs = new Map(), seen = new Set();
+  for (const [id, obj] of tableEntries(k)){ seen.add(id); const s = JSON.stringify(obj); if (synced.get(id) !== s){ rows.push({ id, data: obj }); strs.set(id, s); } }
+  for (const [id, s] of synced) if (!seen.has(id) && s !== "__deleted"){ rows.push({ id, data: { _deleted: true } }); strs.set(id, "__deleted"); }
+  const size = k === "log" ? 100 : 400;   // email rows carry the email text, so smaller chunks
+  for (let i = 0; i < rows.length; i += size){
+    const chunk = rows.slice(i, i + size);
+    const { error } = await CLOUD.sb.from(TABLES[k]).upsert(chunk);
+    if (error) throw error;
+    chunk.forEach(r => synced.set(r.id, strs.get(r.id)));
+  }
+}
+async function fetchAll(table, cols, since){
+  let out = [], from = 0;
+  for (;;){
+    let q = CLOUD.sb.from(table).select(cols).order("updated_at", { ascending: true }).range(from, from + 999);
+    if (since) q = q.gt("updated_at", since);
+    const { data, error } = await q; if (error) throw error;
+    out = out.concat(data); if (data.length < 1000) break; from += 1000;
+  }
+  return out;
+}
+const maxTs = (a, b) => (!a || (b && b > a)) ? b : a;
+/* Bring in changes made on other computers. A local change that hasn't been saved yet always wins. */
+async function cloudPull(full){
+  if (!CLOUD.on || CLOUD.pushing || CLOUD.pulling || (!full && CLOUD.pending.size)) return false;
+  CLOUD.pulling = true; let changed = false, latest = full ? null : CLOUD.lastPull;
+  try {
+    const since = full ? null : CLOUD.lastPull;
+    for (const r of await fetchAll("wc_kv", "key,value,updated_at", since)){
+      latest = maxTs(latest, r.updated_at);
+      if (!KEYS.includes(r.key) || TABLES[r.key]) continue;
+      const str = JSON.stringify(r.value ?? null), local = JSON.stringify(S[r.key] ?? null);
+      if (full || CLOUD.kv[r.key] === undefined || local === CLOUD.kv[r.key]){ if (local !== str){ S[r.key] = r.value; changed = true; } CLOUD.kv[r.key] = str; }
+    }
+    for (const k of ["candidates","log"]){
+      const synced = CLOUD.synced[k], idx = k === "log" ? new Map(S.log.map(e => [e.id, e])) : null; let logChanged = false;
+      for (const r of await fetchAll(TABLES[k], "id,data,updated_at", since)){
+        latest = maxTs(latest, r.updated_at);
+        const str = r.data && r.data._deleted ? "__deleted" : JSON.stringify(r.data);
+        const localObj = k === "candidates" ? S.candidates[r.id] : idx.get(r.id);
+        const localStr = localObj ? JSON.stringify(localObj) : "__deleted";
+        if (!(full || !synced.has(r.id) || synced.get(r.id) === localStr)) continue;
+        synced.set(r.id, str);
+        if (localStr === str) continue;
+        changed = true; if (k === "log") logChanged = true;
+        if (str === "__deleted"){ if (k === "candidates") delete S.candidates[r.id]; else { const i = S.log.indexOf(localObj); if (i >= 0) S.log.splice(i, 1); } }
+        else if (k === "candidates") S.candidates[r.id] = r.data;
+        else if (localObj){ Object.keys(localObj).forEach(x => delete localObj[x]); Object.assign(localObj, r.data); }
+        else { S.log.push(r.data); idx.set(r.id, r.data); }
+      }
+      if (logChanged) S.log.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    }
+    CLOUD.lastPull = latest; if (CLOUD.state === "error") setSync("ok");
+  } catch (e){ setSync("error", e.message || String(e)); }
+  finally { CLOUD.pulling = false; }
+  return changed;
+}
+async function cloudLoad(){
+  const meta = await CLOUD.sb.from("wc_kv").select("value").eq("key", "meta").maybeSingle();
+  if (meta.error) throw meta.error;
+  const localHasData = Object.keys(S.candidates).length > 0 || S.log.length > 0;
+  if (!meta.data){
+    if (!localHasData && !(await askStartEmpty())) return false;
+    // This computer's data becomes the shared starting point
+    CLOUD.on = true; await persistAll();
+    const { error } = await CLOUD.sb.from("wc_kv").upsert({ key: "meta", value: { createdBy: myEmail(), createdOn: PC.id, at: Date.now() } });
+    if (error) throw error;
+    if (localHasData) toast("This computer's data is now shared with every HR computer.", "ok");
+    return true;
+  }
+  if (localHasData && !PC.preSharedBackup){ const snap = {}; KEYS.forEach(k => snap[k] = S[k]); await DB.set("preSharedBackup", snap); PC.preSharedBackup = Date.now(); savePC(); }
+  KEYS.forEach(k => { S[k] = undefined; }); S.candidates = {}; S.log = [];
+  CLOUD.on = true;
+  await cloudPull(true);
+  if (CLOUD.state === "error") throw new Error(CLOUD.err);
+  await applyDefaults();
+  return true;
+}
+function askStartEmpty(){
+  return new Promise(res => {
+    const d = document.createElement("div"); d.className = "gate";
+    d.innerHTML = '<div class="gate-card"><img src="' + LOGO_DEFAULT + '" alt="West-Coast Pharmaceutical Works Ltd."><h2>Shared data is empty</h2><p class="muted">No HR computer has uploaded its data yet. Open the app first on the computer that already has your candidates and email log; its data is uploaded automatically and then appears here.</p><div class="toolbar" style="margin:16px 0 0"><button class="btn" id="gWait">I\'ll do that first</button><button class="btn primary" id="gEmpty">Start with empty data</button></div></div>';
+    document.body.appendChild(d);
+    d.querySelector("#gEmpty").onclick = () => { d.remove(); res(true); };
+    d.querySelector("#gWait").onclick = () => { d.querySelector(".gate-card").innerHTML = '<h2>OK</h2><p class="muted">Open https://' + location.host + ' on the main HR computer and sign in there. Then reload this page.</p>'; res(false); };
+  });
+}
+function signInGate(){
+  return new Promise(res => {
+    const d = document.createElement("div"); d.className = "gate";
+    d.innerHTML = '<form class="gate-card" autocomplete="on"><img src="' + LOGO_DEFAULT + '" alt="West-Coast Pharmaceutical Works Ltd."><h2>Recruitment Mailer</h2><p class="muted small">Sign in with the HR account your admin created for you.</p><div class="field"><label for="gEmail">Email</label><input type="email" id="gEmail" autocomplete="username" required></div><div class="field"><label for="gPass">Password</label><input type="password" id="gPass" autocomplete="current-password" required></div><div class="err-text" id="gErr" style="margin-bottom:10px;max-width:none"></div><button class="btn primary" type="submit" style="width:100%">Sign in</button></form>';
+    document.body.appendChild(d); setTimeout(() => d.querySelector("#gEmail").focus(), 50);
+    d.querySelector("form").onsubmit = async ev => {
+      ev.preventDefault(); const b = d.querySelector("button"); b.disabled = true; b.textContent = "Signing in…";
+      const { error } = await CLOUD.sb.auth.signInWithPassword({ email: d.querySelector("#gEmail").value.trim(), password: d.querySelector("#gPass").value });
+      if (error){ d.querySelector("#gErr").textContent = error.message === "Invalid login credentials" ? "Wrong email or password." : error.message; b.disabled = false; b.textContent = "Sign in"; return; }
+      d.remove(); res();
+    };
+  });
+}
+/* Only one computer sends at a time: the one holding the "sender" lock (renewed every 30 s, expires after 2 min) */
+function pcLabel(){ return (PC.mailboxEmail || PC.connectedEmail || myEmail() || "HR computer") + " on " + (/Windows/.test(navigator.userAgent) ? "Windows PC" : /Mac/.test(navigator.userAgent) ? "Mac" : "computer") + " " + PC.id.slice(-4).toUpperCase(); }
+const isSender = () => !CLOUD.on || !!(CLOUD.lock && CLOUD.lock.owner === PC.id && new Date(CLOUD.lock.until).getTime() > Date.now());
+async function senderHeartbeat(force){
+  if (!CLOUD.on) return;
+  try {
+    let res;
+    if (outlookReady() && !PC.noSend) res = await CLOUD.sb.rpc(force ? "wc_take_sender" : "wc_claim_sender", { p_owner: PC.id, p_label: pcLabel(), p_ttl_seconds: 120 });
+    else res = await CLOUD.sb.from("wc_sender_lock").select("owner,label,until").eq("id", 1).maybeSingle();
+    if (res.error) throw res.error;
+    CLOUD.lock = (Array.isArray(res.data) ? res.data[0] : res.data) || null;
+  } catch (e){ console.warn("sender lock", e); }
+  if (S.settings) { renderConn(); renderQueueStatus(); }
+}
+function senderText(){
+  if (!CLOUD.on) return "";
+  const l = CLOUD.lock, alive = l && new Date(l.until).getTime() > Date.now();
+  if (isSender()) return "Emails are sent from this computer.";
+  if (alive) return "Emails are sent from " + l.label + ".";
+  return "No computer is sending right now. Open the app on a computer with Outlook connected.";
+}
 
 /* ---------- roles ---------- */
 function currentRole(){
   if (!S.users.length) return "Admin";
-  const em = (S.settings.connectedEmail || "").toLowerCase();
+  const em = myEmail();
   const u = S.users.find(u => u.email.toLowerCase() === em);
   return u ? u.role : "Viewer";
 }
@@ -394,7 +568,7 @@ async function initMsal(){
     });
     await msalApp.handleRedirectPromise().catch(() => null);
     const accts = msalApp.getAllAccounts();
-    const want = (S.settings.connectedEmail || "").toLowerCase();
+    const want = (PC.connectedEmail || "").toLowerCase();
     account = accts.find(a => a.username.toLowerCase() === want) || null;
   } catch (e){ console.error(e); msalApp = null; }
 }
@@ -411,15 +585,13 @@ async function connectOutlook(){
       const me = await (await fetch("https://graph.microsoft.com/v1.0/me?$select=displayName,mail,userPrincipalName", { headers: { Authorization: "Bearer " + tok } })).json();
       email = me.mail || me.userPrincipalName || email; name = me.displayName || name;
     } catch {}
-    S.settings.connectedEmail = account.username; S.settings.connectedName = name; S.settings.mailboxEmail = email;
-    await save("settings"); toast("Outlook connected: " + email, "ok"); renderAll();
+    PC.connectedEmail = account.username; PC.connectedName = name; PC.mailboxEmail = email; savePC(); senderHeartbeat(); toast("Outlook connected: " + email, "ok"); renderAll();
   } catch (e){ toast("Outlook connection was not completed: " + (e.errorMessage || e.message || e), "err"); }
 }
 async function disconnectOutlook(){
   if (!confirm("Disconnect Outlook? Automatic sending stops until you connect again.")) return;
   try { if (msalApp && account) await msalApp.logoutPopup({ account, mainWindowRedirectUri: location.href.split("#")[0] }); } catch {}
-  account = null; S.settings.connectedEmail = ""; S.settings.connectedName = ""; S.settings.mailboxEmail = "";
-  await save("settings"); toast("Outlook disconnected."); renderAll();
+  account = null; PC.connectedEmail = ""; PC.connectedName = ""; PC.mailboxEmail = ""; savePC(); toast("Outlook disconnected."); renderAll();
 }
 async function getToken(){
   if (!msalApp || !account) throw new Error("Outlook is not connected.");
@@ -431,7 +603,7 @@ async function getToken(){
 }
 function senderLabel(){
   if (isSim()) return (S.settings.senderName || "HR") + " (simulation, not delivered)";
-  if (account) return (S.settings.connectedName || S.settings.senderName) + " <" + (S.settings.mailboxEmail || S.settings.connectedEmail) + ">";
+  if (account) return (PC.connectedName || S.settings.senderName) + " <" + (PC.mailboxEmail || PC.connectedEmail) + ">";
   return "Outlook not connected";
 }
 
@@ -440,7 +612,7 @@ function varsFor(c){
   const s = S.settings;
   const v = { Candidate_Name: c["Candidate Name"], Candidate_ID: c["Candidate ID"], Position: c["Position Applied"], Department: c["Department"], Location: c["Location"] || s.interviewVenue || s.address,
     Interview_Date: c["Interview Date"], Interview_Time: c["Interview Time"], Candidate_Status: c["Candidate Status"], Email_ID: c["Email ID"], Mobile_Number: c["Mobile Number"],
-    Company_Name: s.companyName, Company_Address: s.address, HR_Name: s.hrName, HR_Email: s.hrEmail || s.mailboxEmail || s.connectedEmail, HR_Mobile: s.hrMobile, Sender_Name: s.senderName };
+    Company_Name: s.companyName, Company_Address: s.address, HR_Name: s.hrName, HR_Email: s.hrEmail || PC.mailboxEmail || PC.connectedEmail, HR_Mobile: s.hrMobile, Sender_Name: s.senderName };
   for (const col of S.columns){ const k = varKey(col); if (!(k in v)) v[k] = c[col]; }
   return v;
 }
@@ -542,6 +714,7 @@ async function sendMany(list, onEach){
   }
 }
 const autoOn = () => S.settings.mode === "auto" && S.settings.testPassed;
+const canSend = () => outlookReady() || CLOUD.on;   // with shared data, another computer may do the sending
 
 /* ---------- batch sending queue: N emails every M minutes ---------- */
 const Q = { running: false, throttleMs: 0, batchDone: 0, batchTotal: 0 };
@@ -555,7 +728,7 @@ function sentToday(){ const now = Date.now(); return S.log.filter(e => e.emailSt
 /* Send a list: straight away when batching is off, otherwise put it in the queue */
 async function dispatch(list, onEach){
   if (!list.length) return;
-  if (!batchOn()){ await sendMany(list, onEach); return; }
+  if (!batchOn() && outlookReady() && isSender()){ await sendMany(list, onEach); return; }
   const now = Date.now();
   list.forEach((e, i) => { if (e.emailStatus === "Pending" || e.emailStatus === "Failed" || e.emailStatus === "Queued"){ e.emailStatus = "Queued"; e.queuedAt = now + i; e.error = ""; addLog(e); } });
   await save("log"); refreshBadges(); setTimeout(runQueue, 300);
@@ -568,29 +741,42 @@ function queueEta(n){
   const ms = (Q.running ? 0 : start) + (batches - 1) * perBatchMs + Math.min(n, batchSize()) * gapMs();
   const m = Math.round(ms / 60000); return m < 1 ? "under a minute" : m < 60 ? "about " + m + " min" : "about " + Math.floor(m / 60) + " hr " + (m % 60) + " min";
 }
+/* At most batchSize emails in any batch window (e.g. 200 per 5 min). A small send goes out at once;
+   when the window is full, the rest waits for the next window. */
+function windowState(){
+  const s = S.settings, now = Date.now();
+  if (!s.windowStart || now >= s.windowStart + batchMs()){ s.windowStart = now; s.windowCount = 0; }
+  const left = Math.max(0, batchSize() - (s.windowCount || 0));
+  s.nextBatchAt = left ? now : s.windowStart + batchMs();
+  return left;
+}
 async function runQueue(){
-  if (Q.running || S.settings.queuePaused || !outlookReady() || UI.busy) return;
-  if ((S.settings.nextBatchAt || 0) > Date.now()) return;
+  if (Q.running || S.settings.queuePaused || !outlookReady() || UI.busy || !isSender()) return;
+  if ((S.settings.holdUntil || 0) > Date.now()) return;
+  if (!queuedList().length) return;
   if (!isSim() && sentToday() >= (+S.settings.dailyCap || 10000)) return;
-  const batch = queuedList().slice(0, batchSize());
-  if (!batch.length) return;
+  const left = batchOn() ? windowState() : 1e9;
+  if (!left){ renderQueueStatus(); return; }
+  const batch = queuedList().slice(0, left);
   Q.running = true; Q.batchDone = 0; Q.batchTotal = batch.length; Q.throttleMs = 0;
-  S.settings.nextBatchAt = Date.now() + batchMs(); await save("settings"); renderQueueStatus();
+  renderQueueStatus();
   try {
     for (const e of batch){
       if (S.settings.queuePaused) break;
       if (e.emailStatus !== "Queued") continue;
       await sendEntry(e);
       S.schedule.forEach(s => { if (s.status === "Queued" && s.logId === e.id && e.emailStatus !== "Queued") s.status = "Done"; });
-      if (Q.throttleMs){ S.settings.nextBatchAt = Date.now() + Q.throttleMs; break; }
-      Q.batchDone++;
-      if (Q.batchDone % 10 === 0 || Q.batchDone === Q.batchTotal) await save("log", "history", "candidates", "schedule");
+      if (Q.throttleMs){ S.settings.holdUntil = Date.now() + Q.throttleMs; break; }
+      Q.batchDone++; S.settings.windowCount = (S.settings.windowCount || 0) + 1;
+      if (Q.batchDone % 10 === 0 || Q.batchDone === Q.batchTotal) await save("log", "history", "candidates", "schedule", "settings");
       renderQueueStatus(); renderNav();
       if (!isSim() && sentToday() >= (+S.settings.dailyCap || 10000)) break;
       await sleep(gapMs());
     }
   } finally {
-    Q.running = false; await save("settings", "log", "history", "candidates", "schedule");
+    Q.running = false;
+    if (batchOn()) windowState();
+    await save("settings", "log", "history", "candidates", "schedule");
     renderNav(); renderQueueStatus();
     if (["log","dashboard"].includes(page()) && !$("#modalBack").classList.contains("open")) renderAll();
   }
@@ -600,14 +786,15 @@ function queueCardHtml(){
   if (!n && !Q.running) return '<div id="qStatus"></div>';
   let state;
   if (s.queuePaused) state = '<span class="pill Failed">Paused</span>';
+  else if (CLOUD.on && !isSender()) state = '<span class="pill ' + (CLOUD.lock && new Date(CLOUD.lock.until).getTime() > Date.now() ? 'Queued">Sent by another computer' : 'Failed">No computer is sending') + '</span>';
   else if (!outlookReady()) state = '<span class="pill Failed">Waiting for Outlook connection</span>';
   else if (Q.running) state = '<span class="pill Processing">Sending batch: ' + Q.batchDone + ' of ' + Q.batchTotal + '</span>';
   else if (!isSim() && sentToday() >= (+s.dailyCap || 10000)) state = '<span class="pill Duplicate">Daily limit of ' + s.dailyCap + ' reached; continues tomorrow</span>';
-  else state = '<span class="pill Queued">Next batch at ' + fmtT(Math.max(Date.now(), s.nextBatchAt || 0)) + '</span>';
+  else state = '<span class="pill Queued">' + ((s.holdUntil || 0) > Date.now() ? 'Outlook asked to slow down; resumes at ' + fmtT(s.holdUntil) : (s.nextBatchAt || 0) > Date.now() ? 'Next batch at ' + fmtT(s.nextBatchAt) : 'Sending shortly') + '</span>';
   const pct = Q.running && Q.batchTotal ? Math.round(Q.batchDone / Q.batchTotal * 100) : 0;
-  return '<div id="qStatus" class="card" style="margin-bottom:18px"><div class="card-head" style="margin-bottom:4px"><div><h2>Sending queue</h2><div class="small muted" style="margin-top:4px"><strong>' + n + '</strong> email(s) waiting. ' + (batchOn() ? batchSize() + ' every ' + (+s.batchMinutes || 5) + ' min' : 'Batching off') + (n ? ', all sent in ' + queueEta(n) : '') + '. Keep this page open while it sends.</div></div><div class="acts">' + state + '</div></div>' +
+  return '<div id="qStatus" class="card" style="margin-bottom:18px"><div class="card-head" style="margin-bottom:4px"><div><h2>Sending queue</h2><div class="small muted" style="margin-top:4px"><strong>' + n + '</strong> email(s) waiting. ' + (batchOn() ? batchSize() + ' every ' + (+s.batchMinutes || 5) + ' min' : 'Batching off') + (n ? ', all sent in ' + queueEta(n) : '') + '. ' + (CLOUD.on ? esc(senderText()) : 'Keep this page open while it sends.') + '</div></div><div class="acts">' + state + '</div></div>' +
     (Q.running ? '<div class="qbar"><i style="width:' + pct + '%"></i></div>' : '') +
-    (can("operate") ? '<div class="toolbar" style="margin:10px 0 0">' + (s.queuePaused ? '<button class="btn primary sm" data-act="qResume">Resume sending</button>' : '<button class="btn sm" data-act="qPause">Pause sending</button>') + (!Q.running && !s.queuePaused ? '<button class="btn sm" data-act="qNow">Send next batch now</button>' : '') + '<a class="btn sm" href="#/log" data-act="qShow">See queued emails</a></div>' : '') + '</div>';
+    (can("operate") ? '<div class="toolbar" style="margin:10px 0 0">' + (s.queuePaused ? '<button class="btn primary sm" data-act="qResume">Resume sending</button>' : '<button class="btn sm" data-act="qPause">Pause sending</button>') + (!Q.running && !s.queuePaused && isSender() ? '<button class="btn sm" data-act="qNow">Send next batch now</button>' : '') + (CLOUD.on && !isSender() && outlookReady() ? '<button class="btn sm" data-act="takeSender">Send from this computer instead</button>' : '') + '<a class="btn sm" href="#/log" data-act="qShow">See queued emails</a></div>' : '') + '</div>';
 }
 function renderQueueStatus(){ const el = $("#qStatus"); if (el) el.outerHTML = queueCardHtml(); renderTop(); }
 
@@ -741,7 +928,7 @@ function ingest(rows, { baseline = false, source = "Excel upload" } = {}){
 /* ---------- scheduler (interview reminders) ---------- */
 let tickBusy = false;
 async function tick(){
-  if (tickBusy) return; tickBusy = true;
+  if (tickBusy || !isSender()) return; tickBusy = true;
   try {
     const now = Date.now(); let changed = false; const send = [];
     for (const s of S.schedule){
@@ -802,19 +989,21 @@ function renderNav(){
 function renderConn(){
   const s = S.settings; let h;
   if (account){
-    h = '<div class="state"><span class="dot ok"></span>Outlook connected</div><div class="who">' + esc(s.mailboxEmail || s.connectedEmail) + '</div><div class="row"><button class="btn sm" data-act="reconnect">Reconnect</button><button class="btn sm danger" data-act="disconnect">Disconnect</button></div>';
+    h = '<div class="state"><span class="dot ok"></span>Outlook connected</div><div class="who">' + esc(PC.mailboxEmail || PC.connectedEmail) + '</div><div class="row"><button class="btn sm" data-act="reconnect">Reconnect</button><button class="btn sm danger" data-act="disconnect">Disconnect</button></div>';
   } else if (!s.clientId){
     h = '<div class="state"><span class="dot warn"></span>Outlook not set up</div><div class="who">Add your Microsoft app ID in Settings, then connect.</div><div class="row"><button class="btn sm primary" data-act="connect">Connect Outlook</button></div>';
   } else {
     h = '<div class="state"><span class="dot err"></span>Outlook not connected</div><div class="who">Sign in with Microsoft. Your password is never seen or stored here.</div><div class="row"><button class="btn sm primary" data-act="connect">Connect Outlook</button></div>';
   }
   if (isSim()) h += '<div class="sim-note">Simulation mode is on: emails are logged but not delivered. Turn it off in Settings.</div>';
+  if (CLOUD.on) h += '<div class="small muted" style="margin-top:10px">' + esc(senderText()) + '</div><div class="small" style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">Signed in: ' + esc(myEmail()) + ' <button class="btn link small" data-act="signOut" style="padding:0 4px">Sign out</button></div>';
   $("#conn").innerHTML = h;
 }
 function renderTop(){
   const m = autoOn() ? '<span class="chip auto">Auto mode</span>' : '<span class="chip appr">Approval mode</span>';
   const qn = S.log.filter(e => e.emailStatus === "Queued").length;
-  $("#topMeta").innerHTML = (qn ? '<span class="chip ' + (S.settings.queuePaused ? "" : "auto") + '">' + qn + ' in sending queue' + (S.settings.queuePaused ? " (paused)" : "") + '</span>' : "") + (isSim() ? '<span class="chip sim">Simulation</span>' : "") + m + '<span class="chip role">' + esc(currentRole()) + '</span>';
+  const sync = !CLOUD.on ? '<span class="chip" title="Data is stored only in this browser">Data on this computer only</span>' : CLOUD.state === "error" ? '<span class="chip sync-error" title="' + esc(CLOUD.err) + '">Not synced, retrying</span>' : CLOUD.state === "saving" ? '<span class="chip sync-saving">Saving…</span>' : '<span class="chip sync-ok">Shared data synced</span>';
+  $("#topMeta").innerHTML = sync + (qn ? '<span class="chip ' + (S.settings.queuePaused ? "" : "auto") + '">' + qn + ' in sending queue' + (S.settings.queuePaused ? " (paused)" : "") + '</span>' : "") + (isSim() ? '<span class="chip sim">Simulation</span>' : "") + m + '<span class="chip role">' + esc(currentRole()) + '</span>';
 }
 function refreshBadges(){ renderNav(); }
 function renderAll(){
@@ -966,7 +1155,7 @@ async function importExcel(file){
     step(3, "active"); await sleep(120);
     const result = ingest(rows, { baseline, source: file.name });
     result.rep.dupRows = ided.dupRows; result.rep.total = norm.length;
-    if (!baseline && autoOn() && outlookReady() && result.toSend.length > 50 && !confirm(result.toSend.length + " emails are about to be sent automatically" + (batchOn() ? ", " + batchSize() + " every " + (+S.settings.batchMinutes || 5) + " min (" + queueEta(result.toSend.length) + ")" : "") + ". Go ahead?\n\nChoose Cancel to keep them in the approval queue instead.")) result.holdAuto = true;
+    if (!baseline && autoOn() && canSend() && result.toSend.length > 50 && !confirm(result.toSend.length + " emails are about to be sent automatically" + (batchOn() ? ", " + batchSize() + " every " + (+S.settings.batchMinutes || 5) + " min (" + queueEta(result.toSend.length) + ")" : "") + ". Go ahead?\n\nChoose Cancel to keep them in the approval queue instead.")) result.holdAuto = true;
     step(3, "done", baseline ? "Saved as starting point; no emails will be sent" : "Compared with " + Math.max(0, Object.keys(S.candidates).length - result.rep.newC) + " saved candidates");
     step(4, "done", result.rep.newC + " new"); step(5, "done", result.rep.changes + " changed");
     step(6, "done", result.entries.filter(e => e.templateId).length + " matched" + (result.rep.noTemplate ? ", " + result.rep.noTemplate + " without a template" : ""));
@@ -984,8 +1173,8 @@ async function importExcel(file){
 async function finishSend(result, stepIdx){
   const r = result.rep;
   if (!result.toSend.length){ step(stepIdx, "done", "Nothing new to send"); return; }
-  if (autoOn() && outlookReady() && !result.holdAuto){
-    if (batchOn()){
+  if (autoOn() && canSend() && !result.holdAuto){
+    if (batchOn() || !outlookReady() || !isSender()){
       await dispatch(result.toSend); r.queued = result.toSend.length;
       step(stepIdx, "done", r.queued + " email(s) added to the sending queue: " + batchSize() + " every " + (+S.settings.batchMinutes || 5) + " min, all sent in " + queueEta(r.queued) + ". Keep the page open.");
       return;
@@ -1003,7 +1192,7 @@ async function finishSend(result, stepIdx){
 }
 async function runIngest(rows, opts){
   const result = ingest(rows, opts);
-  if (autoOn() && outlookReady() && result.toSend.length){ await dispatch(result.toSend); }
+  if (autoOn() && canSend() && result.toSend.length){ await dispatch(result.toSend); }
   await save("candidates", "columns", "log", "history", "schedule", "updates");
   const e = result.entries[0];
   if (!result.entries.length) toast("Candidate saved. No status change, so no email was prepared.", "ok");
@@ -1047,10 +1236,10 @@ function vQueue(){
 }
 async function approve(ids){
   if (!guard("operate")) return;
-  if (!outlookReady()){ toast("Connect Outlook first.", "err"); return; }
+  if (!canSend()){ toast("Connect Outlook first.", "err"); return; }
   const list = S.log.filter(e => ids.includes(e.id) && e.emailStatus === "Pending");
   if (!list.length){ toast("Select at least one email."); return; }
-  if (batchOn()){ await dispatch(list); toast(list.length + " email(s) approved and added to the sending queue: " + batchSize() + " every " + (+S.settings.batchMinutes || 5) + " min.", "ok"); renderAll(); return; }
+  if (batchOn() || !outlookReady() || !isSender()){ await dispatch(list); toast(list.length + " email(s) approved and added to the sending queue: " + batchSize() + " every " + (+S.settings.batchMinutes || 5) + " min.", "ok"); renderAll(); return; }
   toast("Sending " + list.length + " email(s)…");
   await sendMany(list, () => renderNav());
   S.schedule.forEach(s => { if (s.status === "Queued" && list.find(e => e.id === s.logId)) s.status = "Done"; });
@@ -1082,9 +1271,9 @@ function exportLog(){
 }
 async function retry(ids){
   if (!guard("operate")) return;
-  if (!outlookReady()){ toast("Connect Outlook first.", "err"); return; }
+  if (!canSend()){ toast("Connect Outlook first.", "err"); return; }
   const list = S.log.filter(e => ids.includes(e.id) && e.emailStatus === "Failed");
-  if (batchOn() && list.length > 1){ await dispatch(list); toast(list.length + " failed email(s) moved back to the sending queue.", "ok"); renderAll(); return; }
+  if ((batchOn() && list.length > 1) || !outlookReady() || !isSender()){ await dispatch(list); toast(list.length + " failed email(s) moved back to the sending queue.", "ok"); renderAll(); return; }
   await sendMany(list);
   const ok = list.filter(e => e.emailStatus === "Sent").length;
   toast(ok + " of " + list.length + " sent on retry.", ok === list.length ? "ok" : "err"); renderAll();
@@ -1150,7 +1339,11 @@ async function pvSend(){
     if (!validEmail(e.to)){ toast("Enter the email address that should receive the test.", "err"); return; }
     S.settings.testEmail = e.to;
   }
-  if (!outlookReady()){ toast("Connect Outlook first, or turn on simulation mode in Settings.", "err"); return; }
+  if (!outlookReady() && CLOUD.on && kind !== "test"){
+    if (kind === "manual" && S.history[e.dupKey] && !confirm("This email was already sent to " + e.name + " on " + fmtDT(S.history[e.dupKey].sentAt) + ". Send it again?")) return;
+    await dispatch([e]); closeModal(); toast("Added to the sending queue. " + senderText(), "ok"); renderAll(); return;
+  }
+  if (!outlookReady()){ toast("Connect Outlook on this computer first, or turn on simulation mode in Settings.", "err"); return; }
   let force = false;
   if (kind === "manual" && S.history[e.dupKey]){
     if (!confirm("This email was already sent to " + e.name + " on " + fmtDT(S.history[e.dupKey].sentAt) + ". Send it again?")) return;
@@ -1218,7 +1411,7 @@ function testTemplate(tid){
   const t = S.templates.find(x => x.id === tid) || S.templates.find(x => x.active);
   const c = UI.pvCand = sampleCandidate();
   const e = buildDraft(c, t, c["Candidate Status"] || "Test", "Test", "test" + Date.now());
-  e.to = S.settings.testEmail || S.settings.mailboxEmail || S.settings.connectedEmail || "";
+  e.to = S.settings.testEmail || PC.mailboxEmail || PC.connectedEmail || "";
   e.candId = "TEST"; e.name = "Test: " + (c["Candidate Name"] || "");
   openPreview(e, "test");
 }
@@ -1272,7 +1465,8 @@ function vSettings(){
     '<div class="card"><h2>Users & roles</h2><p class="muted small" style="margin:6px 0 12px">Roles apply to whoever connects Outlook in this browser. Admin: everything. HR Manager: templates, statuses and automation. HR Executive: uploads, sending and approvals. Viewer: read-only.</p>' +
     (S.users.length ? '<div class="table-wrap"><table class="grid"><tbody>' + S.users.map((u, i) => '<tr><td>' + esc(u.email) + '</td><td><select data-act="userRole" data-i="' + i + '"' + dis + '>' + ROLES.map(r => '<option ' + (r === u.role ? "selected" : "") + '>' + r + '</option>').join("") + '</select></td><td>' + (adm ? '<button class="btn sm danger" data-act="userDel" data-i="' + i + '">Remove</button>' : "") + '</td></tr>').join("") + '</tbody></table></div>' : '<div class="notice warn">No users added yet, so everyone using this browser has Admin rights. Connect Outlook and add yourself as Admin first.</div>') +
     (adm ? '<div class="toolbar" style="margin:12px 0 0"><input type="email" id="uEmail" class="grow" placeholder="name@company.com"><select id="uRole" style="width:auto">' + ROLES.map(r => '<option>' + r + '</option>').join("") + '</select><button class="btn" data-act="userAdd">Add user</button></div>' : "") + '</div>' +
-    '<div class="card"><h2>Data</h2><p class="muted small" style="margin:6px 0 12px">Candidates, templates, history and the email log are stored in this browser on this computer. Download a backup regularly and before clearing browser data.</p><div class="toolbar" style="margin:0"><button class="btn" data-act="backup">Download backup</button>' + (adm ? '<label class="btn" style="cursor:pointer">Restore backup<input type="file" id="restoreIn" accept=".json" class="hide"></label><button class="btn danger" data-act="reset">Erase all data</button>' : "") + '</div></div></div></div>';
+    '<div class="card"><h2>Shared data</h2>' + (CLOUD.on ? '<p class="muted small" style="margin:6px 0 12px">Candidates, templates, history and the email log are stored in your Supabase database, so every HR computer sees the same data. Signed in as <strong>' + esc(myEmail()) + '</strong>. ' + esc(senderText()) + '</p><div class="toolbar" style="margin:0">' + (outlookReady() && !isSender() ? '<button class="btn" data-act="takeSender">Send emails from this computer</button>' : '') + '<button class="btn" data-act="signOut">Sign out</button></div>' : '<p class="muted small" style="margin:6px 0 0">Data is stored only in this browser. To see the same data on every HR computer, connect a Supabase database (see the setup guide: config.js and supabase_setup.sql).</p>') + '</div>' +
+    '<div class="card"><h2>Data</h2><p class="muted small" style="margin:6px 0 12px">' + (CLOUD.on ? 'Download a backup now and then; it contains everything in the shared database.' : 'Candidates, templates, history and the email log are stored in this browser on this computer. Download a backup regularly and before clearing browser data.') + '</p><div class="toolbar" style="margin:0"><button class="btn" data-act="backup">Download backup</button>' + (adm ? '<label class="btn" style="cursor:pointer">Restore backup<input type="file" id="restoreIn" accept=".json" class="hide"></label><button class="btn danger" data-act="reset">Erase all data</button>' : "") + '</div></div></div></div>';
 }
 
 /* ---------- actions (event delegation) ---------- */
@@ -1324,10 +1518,12 @@ const ACT = {
   stDel: async d => { if (!guard("configure")) return; const st = S.statuses[+d.i]; if (!confirm("Remove status \"" + st.name + "\"? Candidates with this status keep it, but no email is sent for it.")) return; S.statuses.splice(+d.i, 1); await save("statuses"); renderAll(); },
   stAdd: async () => { if (!guard("configure")) return; const v = $("#newStatus").value.trim(); if (!v) return; if (S.statuses.some(s => sameStatus(s.name, v))){ toast("That status already exists.", "err"); return; } S.statuses.push({ name: v, templateId: "", active: true }); await save("statuses"); renderAll(); },
   remSave: async () => { if (!guard("configure")) return; const s = S.settings; s.reminderEnabled = $("#remOn").checked; s.reminderDays = Math.max(0, +$("#remDays").value || 0); s.reminderTime = $("#remTime").value || "09:00"; S.schedule.forEach(r => { if (r.status === "Scheduled") r.dueAt = reminderDue(r.iso); }); Object.values(S.candidates).forEach(syncSchedule); await save("settings", "schedule"); toast("Reminder rule saved.", "ok"); renderAll(); tick(); },
+  signOut: async () => { if (CLOUD.pending.size){ await cloudPush(); } await CLOUD.sb.auth.signOut(); location.reload(); },
+  takeSender: async () => { if (!outlookReady()){ toast("Connect Outlook on this computer first.", "err"); return; } PC.noSend = false; savePC(); await senderHeartbeat(true); toast(isSender() ? "This computer now sends the emails." : "Could not switch; try again.", isSender() ? "ok" : "err"); runQueue(); renderAll(); },
   saveBatch: async () => { if (!guard("configure")) return; const s = S.settings; s.batchEnabled = $("#bOn").checked; s.batchSize = Math.max(1, Math.min(500, +$("#bSize").value || 200)); s.batchMinutes = Math.max(1, Math.min(120, +$("#bMin").value || 5)); s.dailyCap = Math.max(1, Math.min(10000, +$("#bCap").value || 10000)); await save("settings"); toast("Sending speed saved: " + s.batchSize + " every " + s.batchMinutes + " min.", "ok"); renderAll(); },
   qPause: async () => { S.settings.queuePaused = true; await save("settings"); toast("Sending paused. The current email finishes, then it stops."); renderQueueStatus(); renderTop(); },
   qResume: async () => { S.settings.queuePaused = false; await save("settings"); toast("Sending resumed.", "ok"); renderQueueStatus(); runQueue(); },
-  qNow: async () => { S.settings.nextBatchAt = 0; await save("settings"); runQueue(); },
+  qNow: async () => { S.settings.windowStart = 0; S.settings.windowCount = 0; S.settings.holdUntil = 0; await save("settings"); runQueue(); },
   qShow: () => { UI.logStatus = "Queued"; },
   saveDefaults: async () => { if (!guard("configure")) return; S.settings.defaultStatus = $("#defStatus").value; S.settings.interviewVenue = $("#defVenue").value.trim(); await save("settings"); toast("Defaults saved.", "ok"); },
   bulkStatus: () => {
@@ -1342,7 +1538,7 @@ const ACT = {
     if (rows.length > 50 && autoOn() && !confirm(rows.length + " emails will be sent automatically" + (batchOn() ? " (" + batchSize() + " every " + (+S.settings.batchMinutes || 5) + " min)" : "") + ". Continue?")) return;
     UI.busy = false; closeModal(); toast("Updating " + rows.length + " candidate(s)…");
     const result = ingest(rows, { source: "Bulk status change" });
-    if (autoOn() && outlookReady() && result.toSend.length) await dispatch(result.toSend);
+    if (autoOn() && canSend() && result.toSend.length) await dispatch(result.toSend);
     await save("candidates", "log", "history", "schedule", "updates");
     const qd = result.entries.filter(e => e.emailStatus === "Queued").length, sent = result.entries.filter(e => e.emailStatus === "Sent").length, pend = result.entries.filter(e => e.emailStatus === "Pending").length, skip = result.entries.filter(e => e.emailStatus === "Skipped" || e.emailStatus === "Duplicate Prevented").length;
     toast(rows.length + " updated to " + st + ". " + (sent ? sent + " emailed. " : "") + (qd ? qd + " added to the sending queue. " : "") + (pend ? pend + " waiting for approval. " : "") + (skip ? skip + " skipped (see Email log)." : ""), "ok");
@@ -1353,14 +1549,17 @@ const ACT = {
   logoReset: async () => { S.settings.logo = LOGO_DEFAULT; await save("settings"); renderAll(); },
   saveOutlook: async () => { if (!guard("admin")) return; const s = S.settings; const changed = s.clientId !== $("#sClient").value.trim() || s.tenant !== ($("#sTenant").value.trim() || "common"); s.clientId = $("#sClient").value.trim(); s.tenant = $("#sTenant").value.trim() || "common"; s.simulate = $("#sSim").checked; if (!s.simulate && (changed || s.testWasSim)){ s.testPassed = false; if (s.mode === "auto"){ s.mode = "approval"; toast("Approval mode is back on. Send a real test email before using Auto mode.", ""); } } await save("settings"); await initMsal(); toast("Connection settings saved." + (!s.simulate && !account ? " Now click Connect Outlook." : ""), "ok"); renderAll(); },
   userAdd: async () => { if (!guard("admin")) return; const em = $("#uEmail").value.trim().toLowerCase(), role = $("#uRole").value; if (!validEmail(em)){ toast("Enter a valid email address.", "err"); return; }
-    const me = (S.settings.connectedEmail || "").toLowerCase();
-    if (!S.users.length){ if (!me){ toast("Connect Outlook first, so your own account can be added as Admin.", "err"); return; } if (em !== me || role !== "Admin"){ S.users.push({ email: me, role: "Admin" }); toast("Added you (" + me + ") as Admin first.", "ok"); } }
+    const me = myEmail();
+    if (!S.users.length){ if (!me){ toast((CLOUD.on ? "Sign in" : "Connect Outlook") + " first, so your own account can be added as Admin.", "err"); return; } if (em !== me || role !== "Admin"){ S.users.push({ email: me, role: "Admin" }); toast("Added you (" + me + ") as Admin first.", "ok"); } }
     if (S.users.some(u => u.email === em)){ toast("That user is already listed.", "err"); } else S.users.push({ email: em, role });
     await save("users"); renderAll(); },
   userRole: async (d, el) => { if (!guard("admin")) return; const u = S.users[+d.i]; if (u.role === "Admin" && el.value !== "Admin" && S.users.filter(x => x.role === "Admin").length === 1){ toast("Keep at least one Admin.", "err"); el.value = "Admin"; return; } u.role = el.value; await save("users"); renderAll(); },
   userDel: async d => { if (!guard("admin")) return; const u = S.users[+d.i]; if (u.role === "Admin" && S.users.filter(x => x.role === "Admin").length === 1 && S.users.length > 1){ toast("Keep at least one Admin.", "err"); return; } S.users.splice(+d.i, 1); await save("users"); renderAll(); },
   backup: () => { const data = {}; KEYS.forEach(k => data[k] = S[k]); download("recruitment-mailer-backup-" + isoDay(new Date()) + ".json", new Blob([JSON.stringify({ app: "wc-recruitment-mailer", v: 1, at: Date.now(), data })], { type: "application/json" })); },
-  reset: async () => { if (!guard("admin")) return; if (prompt("This erases all candidates, templates, history and the email log in this browser. Type ERASE to confirm.") !== "ERASE") return; await DB.clear(); location.reload(); }
+  reset: async () => { if (!guard("admin")) return;
+    if (prompt(CLOUD.on ? "This erases ALL candidates, templates, history and the email log in the SHARED database, for every HR computer. Type ERASE to confirm." : "This erases all candidates, templates, history and the email log in this browser. Type ERASE to confirm.") !== "ERASE") return;
+    if (CLOUD.on){ for (const t of ["wc_candidates","wc_email_log"]) await CLOUD.sb.from(t).delete().neq("id", ""); await CLOUD.sb.from("wc_kv").delete().neq("key", "meta"); }
+    await DB.clear(); location.reload(); }
 };
 document.addEventListener("click", ev => {
   const b = ev.target.closest("[data-act]"); if (!b) return;
@@ -1374,7 +1573,7 @@ document.addEventListener("change", ev => {
   const b = ev.target.closest("[data-act]");
   if (b && (b.tagName === "INPUT" || b.tagName === "SELECT") && ACT[b.dataset.act]) ACT[b.dataset.act](b.dataset, b, ev);
   if (ev.target.id === "sLogo" && ev.target.files[0]){ const f = ev.target.files[0]; if (f.size > 500 * 1024){ toast("Use a logo under 500 KB so emails stay light.", "err"); return; } readFileB64(f).then(async u => { S.settings.logo = u; await save("settings"); renderAll(); }); }
-  if (ev.target.id === "restoreIn" && ev.target.files[0]){ ev.target.files[0].text().then(async t => { try { const j = JSON.parse(t); if (j.app !== "wc-recruitment-mailer") throw new Error("not a backup from this app"); if (!confirm("Replace all current data with this backup from " + fmtDT(j.at) + "?")) return; for (const k of KEYS) { S[k] = j.data[k]; await DB.set(k, S[k]); } location.reload(); } catch (e){ toast("Backup could not be restored: " + e.message, "err"); } }); }
+  if (ev.target.id === "restoreIn" && ev.target.files[0]){ ev.target.files[0].text().then(async t => { try { const j = JSON.parse(t); if (j.app !== "wc-recruitment-mailer") throw new Error("not a backup from this app"); if (!confirm("Replace all current data with this backup from " + fmtDT(j.at) + "?")) return; for (const k of KEYS) S[k] = j.data[k]; await persistAll(); location.reload(); } catch (e){ toast("Backup could not be restored: " + e.message, "err"); } }); }
   if (ev.target.id === "candAll"){ $$(".csel").forEach(c => c.checked = ev.target.checked); }
   if (ev.target.id === "candStatus"){ UI.candStatus = ev.target.value; renderCandRows(); }
   if (ev.target.id === "logStatus"){ UI.logStatus = ev.target.value; renderLogRows(); }
@@ -1392,12 +1591,35 @@ window.addEventListener("hashchange", () => { closeModal(); renderAll(); window.
 (async function start(){
   try { await loadState(); }
   catch (e){ document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif">This browser blocked local storage (' + esc(e.message) + '). Open the app in a normal (not private) window of Edge or Chrome.</div>'; return; }
+  if (cloudConfigured()){
+    try {
+      CLOUD.sb = supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey, { auth: { persistSession: true, autoRefreshToken: true, storageKey: "wc-recruitment-auth" } });
+      const { data } = await CLOUD.sb.auth.getSession();
+      if (!data.session) await signInGate();
+      CLOUD.user = (await CLOUD.sb.auth.getUser()).data.user;
+      if (!(await cloudLoad())) return;
+    } catch (e){
+      console.error(e);
+      document.body.insertAdjacentHTML("beforeend", '<div class="gate"><div class="gate-card"><h2>Can\'t reach the shared database</h2><p class="muted">' + esc(e.message || String(e)) + '</p><p class="muted small">Check the internet connection, the values in config.js, and that supabase_setup.sql was run. Then reload.</p><button class="btn primary" onclick="location.reload()">Reload</button></div></div>');
+      return;
+    }
+  }
   await initMsal();
   renderAll();
+  if (CLOUD.on){
+    await senderHeartbeat(); setInterval(() => senderHeartbeat(), 30 * 1000);
+    setInterval(async () => {
+      if (await cloudPull(false)){
+        const typing = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+        if (!$("#modalBack").classList.contains("open") && !typing && !Q.running) renderAll(); else { renderNav(); renderTop(); }
+        setTimeout(runQueue, 500);
+      }
+    }, 20 * 1000);
+  }
   tick(); setInterval(tick, 60 * 1000);
   setTimeout(runQueue, 1500); setInterval(runQueue, 15 * 1000);
   setInterval(() => { if (!Q.running && queuedList().length) renderQueueStatus(); }, 30 * 1000);
-  window.addEventListener("beforeunload", ev => { if (Q.running || (queuedList().length && !S.settings.queuePaused)){ ev.preventDefault(); ev.returnValue = "Emails are still being sent. If you close this page, sending pauses until you open it again."; } });
+  window.addEventListener("beforeunload", ev => { if (CLOUD.pending.size || CLOUD.pushing || (isSender() && (Q.running || (queuedList().length && !S.settings.queuePaused)))){ ev.preventDefault(); ev.returnValue = "Emails are still being sent. If you close this page, sending pauses until you open it again."; } });
 })();
 </script>
 </body>
