@@ -8,12 +8,14 @@ Candidate Excel → change detection → status template → Outlook → email s
 |---|---|
 | `index.html` | The complete app (single file) |
 | `redirect.html` | Blank page Microsoft sign-in returns to. Keep it next to `index.html` |
+| `xlsx.full.min.js` | Excel reader, served from your own site so office firewalls can't block it |
+| `msal-browser.min.js` | Microsoft sign-in library, served from your own site |
 | `Sample_1_start.xlsx` | Three test candidates in the bio-data list format |
 | `Sample_2_update.xlsx` | Same people with status and interview changes, plus one new applicant |
 
 ## 1. Deploy (Vercel, 2 minutes)
 
-1. Put `index.html` and `redirect.html` in a new folder (or GitHub repo).
+1. Put `index.html`, `redirect.html`, `xlsx.full.min.js` and `msal-browser.min.js` together in one folder (or GitHub repo).
 2. In Vercel: **Add New → Project**, import the folder/repo, framework preset **Other**, no build command. Deploy.
 3. Note the URL, for example `https://westcoast-recruitment.vercel.app`.
 

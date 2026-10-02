@@ -8,8 +8,12 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,500..800&family=Instrument+Sans:wght@400..600&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"></script>
+<!-- Libraries are loaded from this site first (works behind office firewalls), with public CDNs as backup -->
+<script src="xlsx.full.min.js"></script>
+<script>if(!window.XLSX)document.write('<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"><\/script>');</script>
+<script>if(!window.XLSX)document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"><\/script>');</script>
+<script src="msal-browser.min.js"></script>
+<script>if(!window.msal)document.write('<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"><\/script>');</script>
 <style>
 :root{
   --navy:#393185;--blue:#008DD2;--sky:#00A0E3;
@@ -933,7 +937,7 @@ function reportHtml(r){
 }
 async function importExcel(file){
   if (!guard("operate")) return;
-  if (!window.XLSX){ toast("The Excel reader didn't load. Check your internet connection and reload.", "err"); return; }
+  if (!window.XLSX){ toast("The Excel reader didn't load. Make sure xlsx.full.min.js is uploaded to Vercel next to index.html, then press Ctrl+F5.", "err"); return; }
   const baseline = $("#baseline") ? $("#baseline").checked : false;
   UI.busy = true; stepsModal("Processing " + file.name);
   try {
