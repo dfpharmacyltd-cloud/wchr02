@@ -434,27 +434,54 @@ async function pushKv(k){
   CLOUD.kv[k] = str;
 }
 function tableEntries(k){ return k === "candidates" ? Object.entries(S.candidates) : S.log.map(e => [e.id, e]); }
-async function pushTable(k){
-  const synced = CLOUD.synced[k], rows = [], strs = new Map(), seen = new Set();
-  for (const [id, obj] of tableEntries(k)){ seen.add(id); const s = JSON.stringify(obj); if (synced.get(id) !== s){ rows.push({ id, data: obj }); strs.set(id, s); } }
-  for (const [id, s] of synced) if (!seen.has(id) && s !== "__deleted"){ rows.push({ id, data: { _deleted: true } }); strs.set(id, "__deleted"); }
-  const size = k === "log" ? 100 : 400;   // email rows carry the email text, so smaller chunks
-  for (let i = 0; i < rows.length; i += size){
-    const chunk = rows.slice(i, i + size);
-    const { error } = await CLOUD.sb.from(TABLES[k]).upsert(chunk);
-    if (error) throw error;
-    chunk.forEach(r => synced.set(r.id, strs.get(r.id)));
-  }
+/* What identifies a change. For emails only the fields that change after creation are compared,
+   so thousands of emails don't have to be re-read on every save. */
+function fp(k, o){
+  if (!o || o._deleted) return "__deleted";
+  if (k !== "log") return JSON.stringify(o);
+  return [o.emailStatus, o.sentAt || "", o.error || "", o.attempts || 0, o.queuedAt || "", o.to, o.subject, o.templateId, (o.body || "").length, (o.signature || "").length, (o.attachments || []).join(","), o._v || 0, o.simulated ? 1 : 0].join("\u0001");
 }
-async function fetchAll(table, cols, since){
+async function pushTable(k){
+  const synced = CLOUD.synced[k], full = [], dead = [], strs = new Map(), seen = new Set();
+  for (const [id, obj] of tableEntries(k)){ seen.add(id); const s = fp(k, obj); if (synced.get(id) !== s){ full.push({ id, data: obj }); strs.set(id, s); } }
+  for (const [id, s] of synced) if (!seen.has(id) && s !== "__deleted"){ dead.push({ id, data: { _deleted: true } }); strs.set(id, "__deleted"); }
+  const send = async (rows, size) => {
+    for (let i = 0; i < rows.length; i += size){
+      const chunk = rows.slice(i, i + size);
+      const { error } = await CLOUD.sb.from(TABLES[k]).upsert(chunk);
+      if (error) throw error;
+      chunk.forEach(r => synced.set(r.id, strs.get(r.id)));
+    }
+  };
+  await send(dead, 1000);
+  await send(full, k === "log" ? 100 : 400);   // email rows carry the email text, so smaller chunks
+}
+async function fetchAll(table, cols, since, onProgress){
+  const pk = cols.split(",")[0];
+  const page = from => { let q = CLOUD.sb.from(table).select(cols).order("updated_at", { ascending: true }).order(pk, { ascending: true }).range(from, from + 999); if (since) q = q.gt("updated_at", since); return q; };
+  // Big tables: count first, then fetch 4 pages at a time
+  let total = null;
+  if (!since){ try { const r = await CLOUD.sb.from(table).select(pk, { count: "exact", head: true }); if (!r.error && typeof r.count === "number") total = r.count; } catch {} }
+  if (total !== null && total > 1000){
+    const pages = Math.ceil(total / 1000), out = new Array(pages); let next = 0, done = 0;
+    const worker = async () => { while (next < pages){ const i = next++; const { data, error } = await page(i * 1000); if (error) throw error; out[i] = data; done += data.length; if (onProgress) onProgress(done, total); } };
+    await Promise.all([worker(), worker(), worker(), worker()]);
+    return [].concat(...out);
+  }
   let out = [], from = 0;
   for (;;){
-    let q = CLOUD.sb.from(table).select(cols).order("updated_at", { ascending: true }).range(from, from + 999);
-    if (since) q = q.gt("updated_at", since);
-    const { data, error } = await q; if (error) throw error;
-    out = out.concat(data); if (data.length < 1000) break; from += 1000;
+    const { data, error } = await page(from); if (error) throw error;
+    out = out.concat(data); if (onProgress) onProgress(out.length, total || out.length);
+    if (data.length < 1000) break; from += 1000;
   }
   return out;
+}
+function loadingScreen(msg){
+  let d = $("#loadGate");
+  if (msg === null){ if (d) d.remove(); return; }
+  if (!d){ d = document.createElement("div"); d.id = "loadGate"; d.className = "gate"; d.innerHTML = '<div class="gate-card"><img src="' + LOGO_DEFAULT + '" alt="West-Coast Pharmaceutical Works Ltd."><h2>Loading shared data</h2><p class="muted" id="loadMsg"></p><div class="qbar"><i id="loadBar" style="width:5%"></i></div></div>'; document.body.appendChild(d); }
+  const m = typeof msg === "object" ? msg : { text: msg };
+  $("#loadMsg").textContent = m.text || ""; if (m.pct !== undefined) $("#loadBar").style.width = Math.max(5, m.pct) + "%";
 }
 const maxTs = (a, b) => (!a || (b && b > a)) ? b : a;
 /* Bring in changes made on other computers. A local change that hasn't been saved yet always wins. */
@@ -471,11 +498,12 @@ async function cloudPull(full){
     }
     for (const k of ["candidates","log"]){
       const synced = CLOUD.synced[k], idx = k === "log" ? new Map(S.log.map(e => [e.id, e])) : null; let logChanged = false;
-      for (const r of await fetchAll(TABLES[k], "id,data,updated_at", since)){
+      const label = k === "log" ? "emails" : "candidates";
+      for (const r of await fetchAll(TABLES[k], "id,data,updated_at", since, full ? (n, t) => loadingScreen({ text: "Loading " + label + ": " + n.toLocaleString("en-IN") + " of " + t.toLocaleString("en-IN"), pct: Math.round(n / Math.max(1, t) * 100) }) : null)){
         latest = maxTs(latest, r.updated_at);
-        const str = r.data && r.data._deleted ? "__deleted" : JSON.stringify(r.data);
+        const str = fp(k, r.data);
         const localObj = k === "candidates" ? S.candidates[r.id] : idx.get(r.id);
-        const localStr = localObj ? JSON.stringify(localObj) : "__deleted";
+        const localStr = localObj ? fp(k, localObj) : "__deleted";
         if (!(full || !synced.has(r.id) || synced.get(r.id) === localStr)) continue;
         synced.set(r.id, str);
         if (localStr === str) continue;
@@ -911,7 +939,7 @@ function queueCardHtml(){
   const pct = Q.running && Q.batchTotal ? Math.round(Q.batchDone / Q.batchTotal * 100) : 0;
   return '<div id="qStatus" class="card" style="margin-bottom:18px"><div class="card-head" style="margin-bottom:4px"><div><h2>Sending queue</h2><div class="small muted" style="margin-top:4px"><strong>' + n + '</strong> email(s) waiting. ' + (batchOn() ? batchSize() + ' every ' + (+s.batchMinutes || 5) + ' min' : 'Batching off') + (n ? ', all sent in ' + queueEta(n) : '') + '. ' + (CLOUD.on ? esc(senderText()) : 'Keep this page open while it sends.') + '</div></div><div class="acts">' + state + '</div></div>' +
     (Q.running ? '<div class="qbar"><i style="width:' + pct + '%"></i></div>' : '') +
-    (can("operate") ? '<div class="toolbar" style="margin:10px 0 0">' + (s.queuePaused ? '<button class="btn primary sm" data-act="qResume">Resume sending</button>' : '<button class="btn sm" data-act="qPause">Pause sending</button>') + (!Q.running && !s.queuePaused && isSender() ? '<button class="btn sm" data-act="qNow">Send next batch now</button>' : '') + (CLOUD.on && !isSender() && outlookReady() ? '<button class="btn sm" data-act="takeSender">Send from this computer instead</button>' : '') + '<a class="btn sm" href="#/log" data-act="qShow">See queued emails</a></div>' : '') + '</div>';
+    (can("operate") ? '<div class="toolbar" style="margin:10px 0 0">' + (s.queuePaused ? '<button class="btn primary sm" data-act="qResume">Resume sending</button>' : '<button class="btn sm" data-act="qPause">Pause sending</button>') + (!Q.running && !s.queuePaused && isSender() ? '<button class="btn sm" data-act="qNow">Send next batch now</button>' : '') + (CLOUD.on && !isSender() && outlookReady() ? '<button class="btn sm" data-act="takeSender">Send from this computer instead</button>' : '') + (n ? '<button class="btn sm danger" data-act="qCancel">Cancel waiting emails…</button>' : '') + '<a class="btn sm" href="#/log" data-act="qShow">See queued emails</a></div>' : '') + '</div>';
 }
 function renderQueueStatus(){ const el = $("#qStatus"); if (el) el.outerHTML = queueCardHtml(); renderTop(); }
 
@@ -1490,7 +1518,7 @@ function pvRefresh(editable = true){
 }
 function pvApplyEdits(){
   const { e } = UI.pv; if (!UI.pv.editing) return;
-  e.subject = $("#pvSubjIn").value; e.body = $("#pvBodyIn").value;
+  e.subject = $("#pvSubjIn").value; e.body = $("#pvBodyIn").value; e._v = (e._v || 0) + 1;
 }
 function compose(candId){
   if (!guard("operate")) return;
@@ -1856,6 +1884,37 @@ const ACT = {
     toast(n + " candidate(s) deleted" + (c ? ", " + c + " waiting email(s) cancelled" : "") + ".", "ok");
     renderAll();
   },
+  qCancel: () => {
+    if (!guard("operate")) return;
+    const q = S.log.filter(e => e.emailStatus === "Queued" || e.emailStatus === "Pending");
+    const groups = {}; q.forEach(e => { const k = e.templateName || "—"; groups[k] = (groups[k] || 0) + 1; });
+    const rows = Object.entries(groups).sort((a, b) => b[1] - a[1]);
+    openModal(mHead("Cancel waiting emails") + '<div class="m-body"><p class="muted small">' + q.length.toLocaleString("en-IN") + ' email(s) are waiting (in the sending queue or for approval). Tick the ones to cancel:</p>' +
+      '<label class="check" style="margin-bottom:8px"><input type="checkbox" id="qcAll"> <strong>All waiting emails</strong></label>' +
+      rows.map(([t, n]) => '<label class="check" style="margin:4px 0 4px 24px"><input type="checkbox" class="qcT" value="' + esc(t) + '"> ' + esc(t) + ' <span class="muted">(' + n.toLocaleString("en-IN") + ')</span></label>').join("") +
+      '<label class="check" style="margin-top:14px"><input type="checkbox" id="qcRemove" checked> Remove them from the Email log too (keeps the app fast)</label><div class="hint">Cancelled emails are never sent. People who were not emailed can be emailed again later.</div></div>' +
+      '<div class="m-foot"><button class="btn" data-act="close">Keep them</button><button class="btn danger" data-act="qCancelGo" style="background:var(--err);color:#fff;border-color:var(--err)">Cancel selected emails</button></div>');
+    $("#qcAll").onchange = ev => $$(".qcT").forEach(c => c.checked = ev.target.checked);
+  },
+  qCancelGo: async () => {
+    const all = $("#qcAll").checked, pick = new Set($$(".qcT").filter(c => c.checked).map(c => c.value)), remove = $("#qcRemove").checked;
+    if (!all && !pick.size){ toast("Tick at least one group."); return; }
+    const hit = e => (e.emailStatus === "Queued" || e.emailStatus === "Pending") && (all || pick.has(e.templateName || "—"));
+    const ids = new Set(S.log.filter(hit).map(e => e.id));
+    if (!ids.size) return;
+    if (!confirm("Cancel " + ids.size.toLocaleString("en-IN") + " email(s)? They will not be sent.")) return;
+    S.settings.queuePaused = true;   // stop the sender while we change the queue
+    if (remove) S.log = S.log.filter(e => !ids.has(e.id));
+    else S.log.forEach(e => { if (ids.has(e.id)){ e.emailStatus = "Skipped"; e.error = "Cancelled by HR"; } });
+    S.schedule.forEach(s => { if (s.status === "Queued" && ids.has(s.logId)){ s.status = "Cancelled"; s.note = "Email cancelled by HR"; } });
+    Object.values(S.candidates).forEach(c => { if (c["Email Status"] === "Queued" || c["Email Status"] === "Pending") c["Email Status"] = "Cancelled"; });
+    const left = S.log.filter(e => e.emailStatus === "Queued").length;
+    if (!left) S.settings.queuePaused = false;
+    UI.busy = false; closeModal();
+    toast(ids.size.toLocaleString("en-IN") + " email(s) cancelled. Saving…" + (left ? " Sending is paused; press Resume when ready." : ""), "ok");
+    await save("log", "schedule", "candidates", "settings");
+    renderAll();
+  },
   pickUpload: d => { UI.candStatus = d.kind || "__lastAll"; UI.candSearch = ""; UI.busy = false; closeModal(); if (page() === "candidates") renderAll(); else go("candidates"); },
   selAllMatch: () => { UI.selAllMatch = true; $$(".csel").forEach(c => c.checked = true); const a = $("#candAll"); if (a) a.checked = true; updateSelInfo(); },
   selClear: () => { UI.selAllMatch = false; $$(".csel").forEach(c => c.checked = false); const a = $("#candAll"); if (a) a.checked = false; updateSelInfo(); },
@@ -1920,15 +1979,19 @@ window.addEventListener("hashchange", () => { closeModal(); renderAll(); window.
 (async function start(){
   try { await loadState(); }
   catch (e){ document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif">This browser blocked local storage (' + esc(e.message) + '). Open the app in a normal (not private) window of Edge or Chrome.</div>'; return; }
+  $("#brandLogo").src = LOGO_DEFAULT;
   if (cloudConfigured()){
     try {
       CLOUD.sb = supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey, { auth: { persistSession: true, autoRefreshToken: true, storageKey: "wc-recruitment-auth" } });
       const { data } = await CLOUD.sb.auth.getSession();
       if (!data.session) await signInGate();
       CLOUD.user = (await CLOUD.sb.auth.getUser()).data.user;
-      if (!(await cloudLoad())) return;
+      loadingScreen("Connecting…");
+      const ok = await cloudLoad();
+      loadingScreen(null);
+      if (!ok) return;
     } catch (e){
-      console.error(e);
+      console.error(e); loadingScreen(null);
       document.body.insertAdjacentHTML("beforeend", '<div class="gate"><div class="gate-card"><h2>Can\'t reach the shared database</h2><p class="muted">' + esc(e.message || String(e)) + '</p><p class="muted small">Check the internet connection, the values in config.js, and that supabase_setup.sql was run. Then reload.</p><button class="btn primary" onclick="location.reload()">Reload</button></div></div>');
       return;
     }
