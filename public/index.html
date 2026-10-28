@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WESTCOAST AI Procurement Agent</title>
+<link rel="icon" href="/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css">
+<script src="/logistics.js" defer></script>
+<script src="/app.js" defer></script>
+<script src="/v2.js" defer></script>
+</head>
+<body>
+<div id="jobbar" role="progressbar" aria-label="Request in progress"></div><div id="jobtext" aria-live="polite"></div>
+<div class="app">
+  <aside class="side" id="side">
+    <a class="logo-tile" href="#" data-go="dashboard" aria-label="West-Coast Pharmaceutical Works Ltd."><img alt="West-Coast Pharmaceutical Works Ltd." src="/logo.png" width="480" height="116"></a>
+    <div class="prod">AI Procurement Agent<span>Discover smarter. Verify every claim.</span></div>
+    <nav class="nav" id="nav"></nav>
+    <div class="side-foot"><div>System status</div><div class="health" id="health"></div></div>
+  </aside>
+  <div>
+    <header class="top">
+      <button class="btn sm menu-btn" data-act="menu" aria-label="Open menu">☰</button>
+      <div class="search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="gsearch" placeholder="Search suppliers, purchase requests, emails…  (Ctrl+K)" autocomplete="off" aria-label="Global search">
+        <div id="gres"></div>
+      </div>
+      <div class="who"><span id="whoName"></span><div class="avatar" id="avatar">·</div></div>
+    </header>
+    <main id="main">
+      <div class="skel" style="height:44px;width:320px;margin-bottom:22px"></div>
+      <div class="skel" style="height:300px;margin-bottom:18px"></div>
+      <div class="grid g4"><div class="skel" style="height:110px"></div><div class="skel" style="height:110px"></div><div class="skel" style="height:110px"></div><div class="skel" style="height:110px"></div></div>
+    </main>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<div id="modalRoot"></div>
+</body>
+</html>

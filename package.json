@@ -1,0 +1,21 @@
+{
+  "name": "westcoast-ai-procurement-agent",
+  "version": "2.0.0",
+  "description": "WESTCOAST AI Procurement & Supplier Outreach Agent \u2014 evidence-based API supplier discovery, Apollo.io leads, RFQs via Outlook.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node --test test/server.test.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "xlsx": "0.18.5"
+  },
+  "main": "server.js"
+}
