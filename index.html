@@ -1041,7 +1041,10 @@ async function deliverWA(e){
   if (!e.to || !/^\d{11,15}$/.test(e.to)) throw new Error("Invalid or missing mobile number for WhatsApp.");
   if (isSim()){ await sleep(150); return; }
   const j = await waApi({ action: "send", whatsappNumber: e.to, template_name: e.waTemplate, broadcast_name: "Recruitment " + fmtD(Date.now()), parameters: e.waParams || [] });
-  if (j.result === false || j.validWhatsAppNumber === false) throw new Error(j.info || (j.validWhatsAppNumber === false ? "This number is not on WhatsApp." : "WATI did not accept the message."));
+  // WATI's answer only says whether it ACCEPTED the message. Delivery happens afterwards (see WATI → Broadcast history).
+  // "validWhatsAppNumber: false" is often wrong for numbers WATI has never messaged, so it is not treated as a failure.
+  e.waInfo = String(j.info || "").slice(0, 200); e.waValid = j.validWhatsAppNumber;
+  if (j.result === false || j.result === "false") throw new Error("WATI refused: " + (j.info || "no reason given"));
 }
 function markCand(e){
   if (isWA(e)){ const c = S.candidates[e.candId]; if (!c) return; c._waStatus = e.emailStatus; if (e.emailStatus === "Sent") c._waAt = e.sentAt; return; }
@@ -1841,6 +1844,9 @@ function vWhatsApp(){
     '<div class="card"><div class="card-head"><div><h2>WATI connection</h2><p class="small muted" style="margin-top:4px">' + (S.waConfig.loadedAt ? 'Templates loaded ' + fmtDT(S.waConfig.loadedAt) + ': ' + tpls.filter(t => t.approved).length + ' approved.' : 'Not checked yet.') + (S.waConfig.error ? ' <span class="err-text">' + esc(S.waConfig.error) + '</span>' : '') + '</p></div>' +
     (cfg ? '<button class="btn primary" data-act="waLoad">Check connection & load templates</button>' : '') + '</div>' +
     '<p class="small muted" style="margin:0">WhatsApp goes through your WATI account using WhatsApp-approved templates. ' + (S.queueCtl.paused ? '<strong>Sending is paused</strong> (Queue page). ' : '') + esc(CLOUD.on ? senderText().replace("Emails are", "Messages are") : '') + '</p></div>' +
+    (() => { const f = S.log.filter(e => isWA(e) && e.emailStatus === "Failed" && isMine(e)), nw = f.filter(e => /not on WhatsApp/i.test(e.error || ""));
+      return f.length && can("operate") ? '<div class="card"><h2>Failed WhatsApp messages (' + f.length.toLocaleString("en-IN") + ')</h2><p class="small" style="margin:6px 0 10px">' + (nw.length ? '<strong>' + nw.length.toLocaleString("en-IN") + '</strong> of them were marked "not on WhatsApp" by an older check that was often wrong. WATI may already have sent them. <strong>First check in WATI → Broadcast history</strong> (broadcasts named "Recruitment <date>"): if they show Sent/Delivered there, click <strong>Mark as sent</strong>; if they are not there, click <strong>Send again</strong>.' : 'Open the Email log (filter Failed) to see each reason.') + '</p><div class="toolbar" style="margin:0">' +
+        (nw.length ? '<button class="btn" data-act="waMarkSent">Mark the ' + nw.length.toLocaleString("en-IN") + ' as sent</button>' : '') + '<button class="btn wa" data-act="waRetryFailed">Send again (' + f.length.toLocaleString("en-IN") + ')</button></div></div>' : ''; })() +
     '<div class="card"><h2 style="margin-bottom:6px">Templates and what to fill in</h2><p class="small muted">For each WATI template, choose what goes into its placeholders. Use the variables, for example {{Candidate_Name}}, or type fixed text.</p>' +
     (tpls.length ? tpls.map((t, ti) => '<details class="card" style="margin-top:10px;padding:14px"' + (ti === 0 ? ' open' : '') + '><summary style="cursor:pointer"><strong>' + esc(t.name) + '</strong> ' + (t.approved ? '<span class="pill Sent">Approved</span>' : '<span class="pill Failed">' + esc(t.status || "Not approved") + '</span>') + ' <span class="small muted">' + (t.params.length ? t.params.length + ' placeholder(s)' : 'no placeholders') + '</span></summary>' +
       '<div class="ed" style="margin-top:12px"><div>' + (t.params.length ? t.params.map(p => '<div class="field"><label>{{' + esc(p) + '}}</label><input type="text" class="waMap" data-t="' + esc(t.name) + '" data-p="' + esc(p) + '" value="' + esc((S.waConfig.map[t.name] || {})[p] ?? waGuess(p)) + '" placeholder="e.g. {{Candidate_Name}}"' + (cfg ? '' : ' disabled') + '></div>').join("") + (cfg ? '<button class="btn sm" data-act="waSaveMap" data-t="' + esc(t.name) + '">Save</button>' : '') : '<p class="small muted">This template has no placeholders; it is sent as it is.</p>') + '</div>' +
@@ -2509,6 +2515,21 @@ const ACT = {
       await save("waConfig"); toast("WATI connected: " + S.waConfig.templates.filter(t => t.approved).length + " approved template(s).", "ok");
     } catch (e){ S.waConfig.error = e.message; await save("waConfig"); toast("WATI: " + e.message, "err"); }
     renderAll();
+  },
+  waRetryFailed: async () => {
+    if (!guard("operate")) return;
+    const ids = S.log.filter(e => isWA(e) && e.emailStatus === "Failed" && isMine(e)).map(e => e.id);
+    if (!ids.length) return;
+    if (!confirm("Send " + ids.length.toLocaleString("en-IN") + " WhatsApp messages again?\n\nOnly do this if WATI's Broadcast history shows they were NOT sent, otherwise candidates get the message twice.")) return;
+    const list = S.log.filter(e => ids.includes(e.id)); list.forEach(e => { e.error = ""; });
+    await dispatch(list); await save("log"); toast(ids.length.toLocaleString("en-IN") + " WhatsApp message(s) added to the sending queue.", "ok"); renderAll();
+  },
+  waMarkSent: async () => {
+    if (!guard("operate")) return;
+    const list = S.log.filter(e => isWA(e) && e.emailStatus === "Failed" && isMine(e) && /not on WhatsApp/i.test(e.error || ""));
+    if (!list.length || !confirm("Mark " + list.length.toLocaleString("en-IN") + " WhatsApp messages as sent? Do this only if WATI's Broadcast history shows them as sent.")) return;
+    list.forEach(e => { e.emailStatus = "Sent"; e.sentAt = e.sentAt || e.ts; e.error = ""; e.waInfo = "Marked as sent by HR after checking WATI"; S.history[e.dupKey] = { sentAt: e.sentAt, logId: e.id, templateName: e.templateName }; markCand(e); });
+    await save("log", "history", "candidates"); toast(list.length.toLocaleString("en-IN") + " marked as sent.", "ok"); renderAll();
   },
   waSaveMap: async d => {
     if (!guard("configure")) return;
