@@ -200,6 +200,8 @@ iframe.mail{width:100%;height:460px;border:1px solid var(--line);border-radius:6
 .toast{background:var(--ink);color:#fff;padding:10px 14px;border-radius:6px;font-size:13.5px;box-shadow:0 6px 20px rgba(0,0,0,.2)}
 .toast.err{background:var(--err)}.toast.ok{background:var(--ok)}
 .hide{display:none!important}
+.upd{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:250;background:var(--navy);color:#fff;border-radius:10px;padding:10px 12px 10px 16px;display:flex;gap:12px;align-items:center;box-shadow:0 8px 30px rgba(20,20,60,.3);font-size:14px;max-width:calc(100% - 32px)}
+.upd .btn{background:#fff;color:var(--navy);border-color:#fff}.upd .btn.ghost{background:transparent;color:#fff;border-color:rgba(255,255,255,.4)}
 .rt-bar{display:flex;flex-wrap:wrap;gap:4px;align-items:center;padding:6px;border:1px solid #CBD3E1;border-bottom:0;border-radius:6px 6px 0 0;background:var(--soft)}
 .rt-bar button{font:inherit;font-size:13px;min-width:30px;height:30px;padding:0 8px;border:1px solid transparent;border-radius:5px;background:none;cursor:pointer;color:var(--ink)}
 .rt-bar button:hover{background:#fff;border-color:var(--line)}
@@ -424,7 +426,7 @@ const DB = {
   set(k, v){ return new Promise((res, rej) => { const q = this.db.transaction("kv", "readwrite").objectStore("kv").put(v, k); q.onsuccess = () => res(); q.onerror = () => rej(q.error); }); },
   clear(){ return new Promise((res, rej) => { const q = this.db.transaction("kv", "readwrite").objectStore("kv").clear(); q.onsuccess = () => res(); q.onerror = () => rej(q.error); }); }
 };
-const KEYS = ["settings","statuses","templates","files","candidates","columns","history","log","schedule","users","updates","lastReport","idMap","idSeq","queueCtl","queueState","replies","replyState","waConfig"];
+const KEYS = ["settings","statuses","templates","files","candidates","columns","history","log","schedule","users","updates","lastReport","idMap","idSeq","queueCtl","queueState","replies","replyState","waConfig","backupState"];
 const S = {};
 const UI = { candSearch: "", candStatus: "", logSearch: "", logStatus: "", pv: null, busy: false };
 
@@ -468,6 +470,8 @@ async function applyDefaults(){
   S.queueCtl = S.queueCtl || { paused: !!S.settings.queuePaused };
   S.queueState = S.queueState || {};
   S.replies = S.replies || []; S.replyState = S.replyState || {};
+  S.backupState = S.backupState || {};
+  S.settings.gBackup = Object.assign({ on: false, keepDays: 30, hour: 19, archiveDays: 30 }, S.settings.gBackup || {});
   S.waConfig = S.waConfig || { templates: [], map: {} }; S.waConfig.map = S.waConfig.map || {}; S.waConfig.templates = S.waConfig.templates || [];
   ["queuePaused","nextBatchAt","windowStart","windowCount","holdUntil"].forEach(k => delete S.settings[k]);
   // Outlook connection details belong to each computer, not to the shared data
@@ -512,6 +516,28 @@ const TABLES = { candidates: "wc_candidates", log: "wc_email_log" };
 const CLOUD = { on: false, sb: null, user: null, synced: { candidates: new Map(), log: new Map() }, kv: {}, lastPull: null, pushing: false, pulling: false, pending: new Set(), timer: null, state: "ok", err: "", lock: null };
 const cloudConfigured = () => !!(CFG.supabaseUrl && CFG.supabaseAnonKey && window.supabase);
 const myEmail = () => ((CLOUD.on && CLOUD.user && CLOUD.user.email) || PC.connectedEmail || "").toLowerCase();
+/* ---- per-user data: every HR user has their own candidates, emails, Mail Desk CVs; Admin sees all ---- */
+const myUid = () => (CLOUD.on && CLOUD.user && CLOUD.user.id) || "local";
+const myMeta = () => (CLOUD.on && CLOUD.user && CLOUD.user.app_metadata) || {};
+const isAdminUser = () => !CLOUD.on || myMeta().role === "admin";
+const PER_USER = new Set(["history","schedule","updates","lastReport","idMap","idSeq","queueCtl","queueState","replies","replyState","backupState"]);
+const kvKey = k => (CLOUD.on && PER_USER.has(k)) ? k + "@" + myUid() : k;
+CLOUD.owner = new Map();   // row id → owner (user id), for candidates and emails
+const isMine = e => !CLOUD.on || !CLOUD.owner.has(e.id) || CLOUD.owner.get(e.id) === myUid();
+const idPrefix = () => isAdminUser() ? "WC" : (String(myMeta().code || "U").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4) || "U");
+function ownerName(uidv){
+  if (!uidv) return ""; if (uidv === myUid()) return "Me";
+  const u = (UI.usersList || []).find(x => x.id === uidv); return u ? (u.name || u.email) : "Other user";
+}
+async function apiUsers(body){
+  const { data } = await CLOUD.sb.auth.getSession(); const tok = data && data.session && data.session.access_token;
+  if (!tok) throw new Error("Please sign in again.");
+  const r = await fetch("/api/users", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + tok }, body: JSON.stringify(body) });
+  let j = {}; try { j = await r.json(); } catch {}
+  if (r.status === 404) throw new Error("The user manager (api/users.js) is not deployed on Vercel yet.");
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
 
 function save(...ks){
   if (CLOUD.on){ ks.forEach(k => CLOUD.pending.add(k)); clearTimeout(CLOUD.timer); CLOUD.timer = setTimeout(cloudPush, 700); return Promise.resolve(); }
@@ -538,7 +564,7 @@ async function cloudPush(){
 async function pushKv(k){
   const str = JSON.stringify(S[k] ?? null);
   if (CLOUD.kv[k] === str) return;
-  const { error } = await CLOUD.sb.from("wc_kv").upsert({ key: k, value: S[k] ?? null });
+  const { error } = await CLOUD.sb.from("wc_kv").upsert({ key: kvKey(k), value: S[k] ?? null, owner: PER_USER.has(k) ? myUid() : null });
   if (error) throw error;
   CLOUD.kv[k] = str;
 }
@@ -597,7 +623,7 @@ function loadingScreen(msg){
 async function remoteCheck(e){
   try {
     const [ctl, row] = await Promise.all([
-      CLOUD.sb.from("wc_kv").select("value").eq("key", "queueCtl").maybeSingle(),
+      CLOUD.sb.from("wc_kv").select("value").eq("key", kvKey("queueCtl")).maybeSingle(),
       CLOUD.sb.from("wc_email_log").select("id,data").eq("id", e.id).maybeSingle()
     ]);
     if (!ctl.error && ctl.data && ctl.data.value && ctl.data.value.paused){ S.queueCtl = ctl.data.value; CLOUD.kv.queueCtl = JSON.stringify(ctl.data.value); renderQueueStatus(); return "paused"; }
@@ -612,7 +638,7 @@ async function remoteCheck(e){
 async function pollQueueCtl(){
   if (!CLOUD.on || (CLOUD.pending.has && CLOUD.pending.has("queueCtl"))) return;
   try {
-    const { data, error } = await CLOUD.sb.from("wc_kv").select("value").eq("key", "queueCtl").maybeSingle();
+    const { data, error } = await CLOUD.sb.from("wc_kv").select("value").eq("key", kvKey("queueCtl")).maybeSingle();
     if (error || !data || !data.value) return;
     const str = JSON.stringify(data.value);
     if (str !== JSON.stringify(S.queueCtl)){ S.queueCtl = data.value; CLOUD.kv.queueCtl = str; renderQueueStatus(); renderTop(); if (!S.queueCtl.paused) setTimeout(runQueue, 300); }
@@ -627,15 +653,19 @@ async function cloudPull(full){
     const since = full ? null : CLOUD.lastPull;
     for (const r of await fetchAll("wc_kv", "key,value,updated_at", since)){
       latest = maxTs(latest, r.updated_at);
-      if (!KEYS.includes(r.key) || TABLES[r.key]) continue;
-      const str = JSON.stringify(r.value ?? null), local = JSON.stringify(S[r.key] ?? null);
-      if (full || CLOUD.kv[r.key] === undefined || local === CLOUD.kv[r.key]){ if (local !== str){ S[r.key] = r.value; changed = true; } CLOUD.kv[r.key] = str; }
+      let k = r.key;
+      if (k.includes("@")){ const i = k.lastIndexOf("@"); if (k.slice(i + 1) !== myUid()) continue; k = k.slice(0, i); }   // someone else's private data: skip
+      else if (PER_USER.has(k)) continue;                                                                                     // old shared copy: not used any more
+      if (!KEYS.includes(k) || TABLES[k]) continue;
+      const str = JSON.stringify(r.value ?? null), local = JSON.stringify(S[k] ?? null);
+      if (full || CLOUD.kv[k] === undefined || local === CLOUD.kv[k]){ if (local !== str){ S[k] = r.value; changed = true; } CLOUD.kv[k] = str; }
     }
     for (const k of ["candidates","log"]){
       const synced = CLOUD.synced[k], idx = k === "log" ? new Map(S.log.map(e => [e.id, e])) : null; let logChanged = false;
       const label = k === "log" ? "emails" : "candidates";
-      for (const r of await fetchAll(TABLES[k], "id,data,updated_at", since, full ? (n, t) => loadingScreen({ text: "Loading " + label + ": " + n.toLocaleString("en-IN") + " of " + t.toLocaleString("en-IN"), pct: Math.round(n / Math.max(1, t) * 100) }) : null)){
+      for (const r of await fetchAll(TABLES[k], "id,data,updated_at,owner", since, full ? (n, t) => loadingScreen({ text: "Loading " + label + ": " + n.toLocaleString("en-IN") + " of " + t.toLocaleString("en-IN"), pct: Math.round(n / Math.max(1, t) * 100) }) : null)){
         latest = maxTs(latest, r.updated_at);
+        if (r.owner) CLOUD.owner.set(r.id, r.owner);
         const str = fp(k, r.data);
         const localObj = k === "candidates" ? S.candidates[r.id] : idx.get(r.id);
         const localStr = localObj ? fp(k, localObj) : "__deleted";
@@ -711,8 +741,8 @@ async function senderHeartbeat(force){
   if (!CLOUD.on) return;
   try {
     let res;
-    if (outlookReady() && !PC.noSend) res = await CLOUD.sb.rpc(force ? "wc_take_sender" : "wc_claim_sender", { p_owner: PC.id, p_label: pcLabel(), p_ttl_seconds: 120 });
-    else res = await CLOUD.sb.from("wc_sender_lock").select("owner,label,until").eq("id", 1).maybeSingle();
+    if (outlookReady() && !PC.noSend) res = await CLOUD.sb.rpc(force ? "wc_take_sender2" : "wc_claim_sender2", { p_owner: PC.id, p_label: pcLabel(), p_ttl_seconds: 120 });
+    else res = await CLOUD.sb.from("wc_sender_lock_u").select("owner,label,until").eq("uid", myUid()).maybeSingle();
     if (res.error) throw res.error;
     CLOUD.lock = (Array.isArray(res.data) ? res.data[0] : res.data) || null;
   } catch (e){ console.warn("sender lock", e); }
@@ -728,6 +758,7 @@ function senderText(){
 
 /* ---------- roles ---------- */
 function currentRole(){
+  if (CLOUD.on && CLOUD.user){ const m = myMeta(); return m.role === "admin" ? "Admin" : (["HR Manager","HR Executive","Viewer"].includes(m.app_role) ? m.app_role : "HR Executive"); }
   if (!S.users.length) return "Admin";
   const em = myEmail();
   const u = S.users.find(u => u.email.toLowerCase() === em);
@@ -936,7 +967,7 @@ function fullHtml(e, forPreview){
   const css = rich ? "p{margin:0}ul,ol{margin-top:0;margin-bottom:0;padding-left:36px}li{margin:0}table{border-collapse:collapse}td,th{padding:4px 8px}" : "p{margin:0 0 12px}ul{margin:0 0 12px}";
   return '<!DOCTYPE html><html><head><meta charset="utf-8"><style>' + css + '</style></head><body style="margin:0;padding:' + (forPreview ? "16px 20px" : "0") + ';background:#ffffff">' +
     '<div style="font-family:' + fontStack(e.font || "Calibri").replace(/"/g, "'") + ';font-size:' + (e.fontSize || 11) + 'pt;line-height:' + (rich ? "1.35" : "1.45") + ';color:#000000">' +
-    logo + e.body + (e.signature ? '<div style="margin-top:16px">' + e.signature + '</div>' : "") +
+    logo + (e.body || "") + (e.signature ? '<div style="margin-top:16px">' + e.signature + '</div>' : "") +
     '</div></body></html>';
 }
 
@@ -959,7 +990,7 @@ async function deliver(e){
     atts.push({ "@odata.type": "#microsoft.graph.fileAttachment", name: "logo.png", contentType: meta.slice(5).split(";")[0], contentBytes: b64, isInline: true, contentId: "companylogo" });
   }
   const message = { subject: e.subject, body: { contentType: "HTML", content: fullHtml(e, false) }, toRecipients: [{ emailAddress: { address: e.to, name: e.name || e.to } }], attachments: atts };
-  const r = await fetch("https://graph.microsoft.com/v1.0/me/sendMail", { method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body: JSON.stringify({ message, saveToSentItems: true }) });
+  const r = await fetch("https://graph.microsoft.com/v1.0/me/sendMail", { method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body: JSON.stringify({ message, saveToSentItems: !!S.settings.saveSent }) });
   if (!r.ok){
     let msg = "Outlook returned HTTP " + r.status;
     try { const j = await r.json(); if (j.error) msg = j.error.code + ": " + j.error.message; } catch {}
@@ -1055,18 +1086,18 @@ const batchSize = () => Math.max(1, Math.min(500, +S.settings.batchSize || 200))
 const batchMs = () => Math.max(1, +S.settings.batchMinutes || 5) * 60000;
 const MIN_GAP = 2100;   // Exchange Online allows about 30 messages per minute per mailbox
 function gapMs(){ return isSim() ? 40 : Math.max(MIN_GAP, Math.floor(batchMs() / batchSize() * 0.9)); }
-function queuedList(){ return S.log.filter(e => e.emailStatus === "Queued" && !isWA(e)).sort((a, b) => (a.queuedAt || 0) - (b.queuedAt || 0)); }
+function queuedList(){ return S.log.filter(e => e.emailStatus === "Queued" && !isWA(e) && isMine(e)).sort((a, b) => (a.queuedAt || 0) - (b.queuedAt || 0)); }
 function sentToday(){ const now = Date.now(); return S.log.filter(e => e.emailStatus === "Sent" && !isWA(e) && e.trigger !== "Test" && !e.simulated && sameDay(e.sentAt, now)).length; }
 /* WhatsApp queue: sent by the sending computer, about one message per second */
 const QW = { running: false, throttleMs: 0 };
-function waQueued(){ return S.log.filter(e => e.emailStatus === "Queued" && isWA(e)).sort((a, b) => (a.queuedAt || 0) - (b.queuedAt || 0)); }
+function waQueued(){ return S.log.filter(e => e.emailStatus === "Queued" && isWA(e) && isMine(e)).sort((a, b) => (a.queuedAt || 0) - (b.queuedAt || 0)); }
 async function runWaQueue(){
   if (QW.running || S.queueCtl.paused || UI.busy || !isSender() || (S.queueState.waHoldUntil || 0) > Date.now()) return;
   const list = waQueued(); if (!list.length) return;
   QW.running = true; QW.throttleMs = 0; let n = 0;
   try {
     for (const e of list){
-      if (S.queueCtl.paused) break;
+      if (S.queueCtl.paused || UI.updating) break;
       if (e.emailStatus !== "Queued" || !S.log.includes(e)) continue;
       if (CLOUD.on){ const chk = await remoteCheck(e); if (chk === "paused") break; if (chk === "gone") continue; }
       await sendEntry(e); n++;
@@ -1121,7 +1152,7 @@ async function runQueue(){
   renderQueueStatus();
   try {
     for (const e of batch){
-      if (S.queueCtl.paused) break;
+      if (S.queueCtl.paused || UI.updating) break;
       if (e.emailStatus !== "Queued" || !S.log.includes(e)) continue;
       if (CLOUD.on){
         const chk = await remoteCheck(e);
@@ -1225,7 +1256,7 @@ function assignIds(rows){
   let changedMap = false;
   for (const [k, c] of byKey){
     if (k.startsWith("id:")) continue;
-    if (!S.idMap[k]){ S.idSeq = (S.idSeq || 0) + 1; S.idMap[k] = "WC" + String(S.idSeq).padStart(5, "0"); changedMap = true; }
+    if (!S.idMap[k]){ S.idSeq = (S.idSeq || 0) + 1; S.idMap[k] = idPrefix() + String(S.idSeq).padStart(5, "0"); changedMap = true; }
     c["Candidate ID"] = S.idMap[k];
   }
   return { rows: [...byKey.values()], dupRows, changedMap };
@@ -1389,7 +1420,8 @@ function renderTop(){
   const m = autoOn() ? '<span class="chip auto">Auto mode</span>' : '<span class="chip appr">Approval mode</span>';
   const qn = S.log.filter(e => e.emailStatus === "Queued").length;
   const sync = !CLOUD.on ? '<span class="chip" title="Data is stored only in this browser">Data on this computer only</span>' : CLOUD.state === "error" ? '<span class="chip sync-error" title="' + esc(CLOUD.err) + '">Not synced, retrying</span>' : CLOUD.state === "saving" ? '<span class="chip sync-saving">Saving…</span>' : '<span class="chip sync-ok">Shared data synced</span>';
-  $("#topMeta").innerHTML = sync + (qn ? '<span class="chip ' + (S.queueCtl.paused ? "" : "auto") + '">' + qn + ' in sending queue' + (S.queueCtl.paused ? " (paused)" : "") + '</span>' : "") + (isSim() ? '<span class="chip sim">Simulation</span>' : "") + m + '<span class="chip role">' + esc(currentRole()) + '</span>';
+  const bkChip = BK.running ? '<span class="chip sync-saving">Backing up…</span>' : (S.backupState && S.backupState.needLogin && isAdminUser() && S.settings.gBackup && S.settings.gBackup.on) ? '<button class="chip sync-error" data-act="bkNow" style="border:0;cursor:pointer">Backup: sign in to Google</button>' : '';
+  $("#topMeta").innerHTML = bkChip + sync + (qn ? '<span class="chip ' + (S.queueCtl.paused ? "" : "auto") + '">' + qn + ' in sending queue' + (S.queueCtl.paused ? " (paused)" : "") + '</span>' : "") + (isSim() ? '<span class="chip sim">Simulation</span>' : "") + m + '<span class="chip role">' + esc(currentRole()) + '</span>';
 }
 function refreshBadges(){ renderNav(); }
 function renderAll(){
@@ -1486,6 +1518,7 @@ function vCandidates(){
   const opts = S.statuses.map(s => '<option ' + (sameStatus(UI.candStatus, s.name) ? "selected" : "") + '>' + esc(s.name) + '</option>').join("");
   return '<div class="toolbar"><input class="grow" type="search" id="candSearch" placeholder="Search name, ID, email or position" value="' + esc(UI.candSearch) + '" aria-label="Search candidates">' +
     (() => { const lc = listCounts(), names = Object.keys(lc).sort((a, b) => a.localeCompare(b)); return names.length ? '<select id="candList" style="width:auto;max-width:240px" aria-label="Filter by data name"><option value="">All data</option>' + names.map(n => '<option value="' + esc(n) + '"' + (UI.candList === n ? " selected" : "") + '>' + esc(n) + ' (' + lc[n] + ')</option>').join("") + '<option value="__none"' + (UI.candList === "__none" ? " selected" : "") + '>Without a data name</option></select>' : ""; })() +
+    (CLOUD.on && isAdminUser() && (UI.usersList || []).length > 1 ? '<select id="candOwner" style="width:auto" aria-label="Filter by user"><option value="">All users</option>' + UI.usersList.map(u => '<option value="' + esc(u.id) + '"' + (UI.candOwner === u.id ? " selected" : "") + '>' + esc(u.id === myUid() ? "Me (Admin)" : (u.name || u.email)) + '</option>').join("") + '</select>' : "") +
     '<select id="candStatus" style="width:auto" aria-label="Filter by status"><option value="">All statuses</option>' + opts + '<option value="__invalid"' + (UI.candStatus === "__invalid" ? " selected" : "") + '>Invalid or missing email</option>' +
     (S.lastReport && S.lastReport.uploadId ? '<optgroup label="Last upload (' + esc(S.lastReport.file || "") + ')">' + [["__lastAll","New + changed"],["__lastNew","New only"],["__lastChanged","Changed only"]].map(([v, l]) => '<option value="' + v + '"' + (UI.candStatus === v ? " selected" : "") + '>' + l + ' (' + lastUploadIds(v).length + ')</option>').join("") + '</optgroup>' : "") +
     '<option value="__notEmailed"' + (UI.candStatus === "__notEmailed" ? " selected" : "") + '>Never emailed</option>' +
@@ -1508,6 +1541,7 @@ function renderCandRows(){
   else if (UI.candStatus === "__replied") list = list.filter(c => c._replyAt);
   else if (UI.candStatus === "__noReply") list = list.filter(c => c["Email Sent"] === "Yes" && !c._replyAt);
   else if (UI.candStatus) list = list.filter(c => sameStatus(c["Candidate Status"], UI.candStatus));
+  if (UI.candOwner) list = list.filter(c => (CLOUD.owner.get(c["Candidate ID"]) || myUid()) === UI.candOwner);
   if (UI.candList === "__none") list = list.filter(c => !(c._lists || []).length);
   else if (UI.candList) list = list.filter(c => (c._lists || []).includes(UI.candList));
   if (q) list = list.filter(c => ["Candidate ID","Candidate Name","Email ID","Position Applied","Qualification","City","Mobile Number"].some(k => String(c[k] || "").toLowerCase().includes(q)));
@@ -1865,6 +1899,7 @@ function openPreview(e, kind){
   const tplSel = kind === "manual" ? '<select id="pvTpl" style="max-width:340px">' + S.templates.filter(t => t.active).map(t => '<option value="' + t.id + '" ' + (t.id === e.templateId ? "selected" : "") + '>' + esc(t.name) + '</option>').join("") + '</select>' : esc(e.templateName);
   const vars = kind === "test" ? '<details style="margin-bottom:12px"><summary class="small" style="cursor:pointer;font-weight:600">Candidate variables used</summary><div class="table-wrap" style="margin-top:8px"><table class="grid"><tbody>' + Object.entries(varsFor(UI.pvCand || sampleCandidate())).filter(([k]) => VAR_LIST.includes(k)).map(([k, v]) => '<tr><td class="small" style="font-family:ui-monospace,Consolas,monospace">{{' + k + '}}</td><td>' + (v ? esc(v) : '<span class="err-text">empty</span>') + '</td></tr>').join("") + '</tbody></table></div></details>' : "";
   openModal(mHead(titles[kind]) + '<div class="m-body">' +
+    (kind === "view" && e.archived ? '<div class="notice info">The full text of this older email was moved to the Google Drive backup (' + esc(e.archived) + ') to keep the online database small.</div>' : '') +
     (kind === "view" ? '<div style="margin-bottom:12px">' + pill(e.emailStatus) + ' <span class="small muted">' + esc(e.trigger || "") + (e.attempts ? ", " + e.attempts + " attempt(s)" : "") + '</span>' + (e.error ? '<div class="notice err" style="margin-top:10px">' + esc(e.error) + '</div>' : "") + '</div>' : "") +
     '<dl class="meta"><dt>From</dt><dd>' + esc(senderLabel()) + '</dd><dt>To</dt><dd>' + toField + '</dd><dt>Template</dt><dd>' + tplSel + '</dd><dt>Subject</dt><dd id="pvSubj">' + esc(e.subject) + '</dd></dl>' +
     '<div id="pvMissing"></div>' + vars +
@@ -2082,7 +2117,7 @@ function vAutomation(){
     '</tbody></table></div>' + (cfg ? '<div class="toolbar" style="margin:14px 0 0"><input type="text" id="newStatus" class="grow" placeholder="New status, e.g. Second Round Interview"><button class="btn" data-act="stAdd">Add status</button></div>' : "") + '</div>' +
     '<div class="card"><h2>Sending speed</h2><p class="muted small" style="margin:6px 0 14px">Big lists are sent in batches so Outlook doesn\'t block the mailbox. Example: 200 emails, wait for the next 5-minute slot, next 200, and so on.</p>' +
     '<label class="check" style="margin-bottom:12px"><input type="checkbox" id="bOn" ' + (batchOn() ? "checked" : "") + dis + '> Send in batches</label>' +
-    '<div class="toolbar"><span>Send</span><input type="number" id="bSize" min="1" max="500" value="' + esc(batchSize()) + '" style="width:90px"' + dis + '><span>emails every</span><input type="number" id="bMin" min="1" max="120" value="' + esc(+s.batchMinutes || 5) + '" style="width:80px"' + dis + '><span>minutes. Stop after</span><input type="number" id="bCap" min="1" max="10000" value="' + esc(+s.dailyCap || 10000) + '" style="width:100px"' + dis + '><span>emails per day.</span>' + (cfg ? '<button class="btn" data-act="saveBatch">Save sending speed</button>' : "") + '</div>' +
+    '<div class="toolbar"><span>Send</span><input type="number" id="bSize" min="1" max="500" value="' + esc(batchSize()) + '" style="width:90px"' + dis + '><span>emails every</span><input type="number" id="bMin" min="1" max="120" value="' + esc(+s.batchMinutes || 5) + '" style="width:80px"' + dis + '><span>minutes. Stop after</span><input type="number" id="bCap" min="1" max="10000" value="' + esc(+s.dailyCap || 10000) + '" style="width:100px"' + dis + '><span>emails per day.</span>' + '<label class="check" style="margin:0 12px 0 0"><input type="checkbox" id="bSent" ' + (s.saveSent ? "checked" : "") + dis + '> Keep a copy in Outlook Sent Items</label>' + (cfg ? '<button class="btn" data-act="saveBatch">Save sending speed</button>' : "") + '</div>' +
     (batchSize() / (+s.batchMinutes || 5) > 28 ? '<div class="notice warn">Outlook (Exchange Online) accepts about 30 emails per minute from one mailbox. ' + batchSize() + ' every ' + (+s.batchMinutes || 5) + ' min is faster than that, so the app spaces emails about 2 seconds apart and each batch takes about ' + Math.ceil(batchSize() * MIN_GAP / 60000) + ' min. The next batch starts as soon as the previous one finishes. For an exact 5-minute rhythm, use 140 or fewer.</div>' : '<div class="notice info">Emails in a batch are spread over the ' + (+s.batchMinutes || 5) + ' minutes (about one every ' + Math.round(gapMs() / 1000) + ' s). Exchange Online allows up to 10,000 recipients per day; your IT team may have set a lower limit.</div>') + '</div>' +
     '<div class="card"><h2>Defaults for the bio-data list</h2><div class="fgrid" style="margin-top:12px"><div class="field"><label for="defStatus">Status for new candidates when the file has no status</label><select id="defStatus"' + dis + '>' + S.statuses.map(st => '<option ' + (sameStatus(st.name, s.defaultStatus) ? "selected" : "") + '>' + esc(st.name) + '</option>').join("") + '</select><div class="hint">Its template is what new applicants receive.</div></div><div class="field"><label for="defVenue">Interview venue</label><input type="text" id="defVenue" value="' + esc(s.interviewVenue || "") + '"' + dis + '><div class="hint">Used for {{Location}} when the file has no Location column.</div></div></div>' + (cfg ? '<button class="btn" data-act="saveDefaults">Save defaults</button>' : "") + '</div>' +
     '<div class="card"><h2>Interview reminder</h2><p class="muted small" style="margin:6px 0 14px">For candidates with status Interview Scheduled and an interview date, send the Interview Reminder template before the interview.</p>' +
@@ -2092,6 +2127,118 @@ function vAutomation(){
 }
 
 /* ---------- settings ---------- */
+/* ---- Users (Admin creates sign-ins; each user sees only their own data) ---- */
+function usersCardHtml(){
+  if (!isAdminUser()) return '<h2>Your account</h2><p class="small" style="margin:8px 0 0">Signed in as <strong>' + esc(myEmail()) + '</strong> (' + esc(currentRole()) + '). You see only your own candidates, emails and inbox CVs. Your Candidate IDs start with <strong>' + esc(idPrefix()) + '</strong>. Only the Admin can add users or reset passwords.</p>';
+  if (!UI.usersLoaded && !UI.usersLoading){ UI.usersLoading = true; apiUsers({ action: "list" }).then(j => { UI.usersList = j.users || []; UI.usersErr = ""; }).catch(e => { UI.usersErr = e.message; }).finally(() => { UI.usersLoaded = true; UI.usersLoading = false; const el = $("#usersCard"); if (el) el.innerHTML = usersCardHtml(); }); }
+  const list = UI.usersList || [];
+  const roleSel = (u) => u.role === "Admin" ? '<strong>Admin</strong>' : '<select data-act="uRoleSet" data-id="' + esc(u.id) + '" style="width:auto">' + ["HR Manager","HR Executive","Viewer"].map(r => '<option ' + (r === u.role ? "selected" : "") + '>' + r + '</option>').join("") + '</select>';
+  return '<div class="card-head" style="margin-bottom:6px"><div><h2>Users</h2><p class="muted small" style="margin-top:4px">Create a sign-in for each HR person. Each user sees only their own candidates, emails, WhatsApp and inbox CVs (from the Outlook they connect). You, the Admin, see everything.</p></div></div>' +
+    (UI.usersErr ? '<div class="notice err">' + esc(UI.usersErr) + '</div>' : '') +
+    (UI.newCred ? '<div class="notice ok"><strong>Send these details to ' + esc(UI.newCred.name || UI.newCred.email) + ':</strong><pre id="credText" style="white-space:pre-wrap;margin:8px 0;font-family:inherit">' + esc(UI.newCred.text) + '</pre><button class="btn sm" data-act="copyCred">Copy</button> <button class="btn sm" data-act="hideCred">Done</button></div>' : '') +
+    (!UI.usersLoaded ? '<p class="muted small">Loading users…</p>' : list.length ? '<div class="table-wrap"><table class="grid"><thead><tr><th>Name / email</th><th>ID prefix</th><th>Role</th><th>Status</th><th>Last sign-in</th><th></th></tr></thead><tbody>' +
+      list.map(u => '<tr><td><strong>' + esc(u.name || "—") + '</strong><div class="small muted">' + esc(u.email) + '</div></td><td>' + esc(u.role === "Admin" ? "WC" : (u.code || "")) + '</td><td>' + roleSel(u) + '</td><td>' + (u.disabled ? '<span class="pill Failed">Disabled</span>' : '<span class="pill Sent">Active</span>') + '</td><td class="small nowrap">' + (u.lastSignIn ? fmtDT(Date.parse(u.lastSignIn)) : '<span class="muted">never</span>') + '</td><td><div class="acts">' +
+        (u.role === "Admin" ? '' : '<button class="btn sm" data-act="uPass" data-id="' + esc(u.id) + '">New password</button><button class="btn sm" data-act="uDisable" data-id="' + esc(u.id) + '" data-on="' + (u.disabled ? "0" : "1") + '">' + (u.disabled ? "Enable" : "Disable") + '</button><button class="btn sm danger" data-act="uDelete" data-id="' + esc(u.id) + '">Delete</button>') + '</div></td></tr>').join("") + '</tbody></table></div>' : '<p class="muted small">No users yet.</p>') +
+    '<details style="margin-top:14px" ' + (list.length <= 1 ? "open" : "") + '><summary style="cursor:pointer;font-weight:600">+ Add user</summary><div class="fgrid" style="margin-top:12px">' +
+      '<div class="field"><label for="nuName">Name</label><input type="text" id="nuName" placeholder="Priya Mehta"></div>' +
+      '<div class="field"><label for="nuEmail">Sign-in email (their own mail ID)</label><input type="email" id="nuEmail" placeholder="priya@westcoastin.com"></div>' +
+      '<div class="field"><label for="nuPass">Password</label><div style="display:flex;gap:6px"><input type="text" id="nuPass" placeholder="at least 8 characters"><button class="btn sm" data-act="genPass" type="button">Generate</button></div></div>' +
+      '<div class="field"><label for="nuCode">ID prefix (2–4 letters)</label><input type="text" id="nuCode" maxlength="4" placeholder="PM"><div class="hint">Their Candidate IDs become PM00001, PM00002… so IDs never clash.</div></div>' +
+      '<div class="field"><label for="nuRole">Role</label><select id="nuRole"><option>HR Executive</option><option>HR Manager</option><option>Viewer</option></select><div class="hint">HR Executive: upload, send, approve, Mail Desk. HR Manager: also templates and automation (shared by everyone). Viewer: read only.</div></div>' +
+    '</div><button class="btn primary" data-act="uCreate">Create user</button></details>';
+}
+/* ===== Automatic backup to Google Drive + keeping the online database small =====
+   Once a day (Admin's computer) everything is uploaded to Google Drive:
+   an Excel workbook (candidates, emails, WhatsApp, Mail Desk CVs) and a full backup file.
+   After a successful backup, the text of old finished emails is removed from the online database
+   (it stays in the Drive backups), so the database stays small and the app opens fast. */
+const BK = { running: false };
+const bkFolderName = "Recruitment Mailer – Backups";
+async function gUpload(name, mime, blob, parent){
+  const g = Desk.google, boundary = "wcb" + Math.random().toString(36).slice(2);
+  const body = new Blob(["--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + JSON.stringify({ name, parents: [parent] }) + "\r\n--" + boundary + "\r\nContent-Type: " + mime + "\r\n\r\n", blob, "\r\n--" + boundary + "--"]);
+  return g.fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink", { method: "POST", headers: { "Content-Type": "multipart/related; boundary=" + boundary }, body }, false);
+}
+async function bkFolder(){
+  const g = Desk.google, st = S.backupState;
+  if (st.folderId){ try { await g.fetch("https://www.googleapis.com/drive/v3/files/" + st.folderId + "?fields=id,trashed"); return st.folderId; } catch (e){ if (!/404|not found/i.test(e.message)) throw e; } }
+  const f = await g.fetch("https://www.googleapis.com/drive/v3/files?fields=id,webViewLink", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: bkFolderName, mimeType: "application/vnd.google-apps.folder" }) });
+  st.folderId = f.id; st.folderLink = f.webViewLink || ("https://drive.google.com/drive/folders/" + f.id); return f.id;
+}
+function bkWorkbook(){
+  const wb = XLSX.utils.book_new(), cell = v => { v = v == null ? "" : typeof v === "object" ? (Array.isArray(v) ? v.join(", ") : JSON.stringify(v)) : String(v); return v.length > 32000 ? v.slice(0, 32000) : v; };
+  const cands = Object.values(S.candidates).filter(Boolean).map(c => { const o = { "User": ownerName(CLOUD.owner.get(c["Candidate ID"]) || myUid()) }; S.columns.forEach(col => o[label(col)] = cell(c[col])); o["Data Name"] = cell(c._lists || []); o["WhatsApp"] = c._waStatus || ""; o["Replied On"] = c._replyAt ? fmtDT(c._replyAt) : ""; return o; });
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(cands.length ? cands : [{ Note: "No candidates" }]), "Candidates");
+  const mails = S.log.filter(e => !isWA(e)).map(e => ({ "Date": fmtDT(e.ts), "User": ownerName(CLOUD.owner.get(e.id) || myUid()), "Candidate ID": e.candId, "Name": e.name, "Email": e.to, "Status": e.status, "Template": e.templateName, "Subject": e.subject, "Email status": e.emailStatus, "Error": e.error || "", "Sent": fmtDT(e.sentAt) }));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(mails.length ? mails : [{ Note: "No emails" }]), "Emails");
+  const was = S.log.filter(isWA).map(e => ({ "Date": fmtDT(e.ts), "User": ownerName(CLOUD.owner.get(e.id) || myUid()), "Candidate ID": e.candId, "Name": e.name, "Number": "+" + e.to, "Template": e.waTemplate, "Status": e.emailStatus, "Error": e.error || "", "Sent": fmtDT(e.sentAt) }));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(was.length ? was : [{ Note: "No WhatsApp messages" }]), "WhatsApp");
+  let md = []; try { md = Desk.sheetRows(); } catch {}
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(md.length ? md : [{ Note: "No Mail Desk candidates" }]), "Mail Desk CVs");
+  return new Blob([XLSX.write(wb, { bookType: "xlsx", type: "array", compression: true })], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+}
+async function bkFull(){
+  const data = {}; KEYS.forEach(k => data[k] = S[k]);
+  let mails = []; try { mails = Desk.mails(); } catch {}
+  const json = JSON.stringify({ app: "wc-recruitment-mailer", v: 2, at: Date.now(), by: myEmail(), owners: Object.fromEntries(CLOUD.owner), data, mailDesk: mails });
+  if (window.CompressionStream){ const s = new Blob([json]).stream().pipeThrough(new CompressionStream("gzip")); return { blob: await new Response(s).blob(), ext: ".json.gz", mime: "application/gzip" }; }
+  return { blob: new Blob([json], { type: "application/json" }), ext: ".json", mime: "application/json" };
+}
+/* remove the full text of old finished emails from the online database (they are in the Drive backup) */
+function bkArchive(fileName){
+  const days = +S.settings.gBackup.archiveDays || 30; if (days <= 0) return 0;
+  const cut = Date.now() - days * 864e5; let n = 0;
+  for (const e of S.log){
+    if (!e || e.archived || !["Sent","Failed","Skipped","Duplicate Prevented"].includes(e.emailStatus)) continue;
+    if ((e.sentAt || e.ts || 0) > cut || !(e.body || e.signature || e.waParams)) continue;
+    delete e.body; delete e.signature; delete e.waParams; delete e.missing; e.archived = fileName; e._v = (e._v || 0) + 1; n++;
+  }
+  if (n) save("log");
+  return n;
+}
+async function runBackup(interactive){
+  if (BK.running) return; const st = S.backupState;
+  if (!Desk || !Desk.google || !Desk.google.ready()){ if (interactive) toast("Set up Google first: Mail Desk settings → Google Client ID → Connect Google.", "err"); return; }
+  if (!Desk.google.valid()){
+    if (!interactive){ st.needLogin = true; renderTop(); return; }
+    try { await Desk.google.signIn(); } catch (e){ toast(e.message, "err"); return; }
+  }
+  BK.running = true; renderTop(); if (interactive) toast("Backing up to Google Drive…");
+  try {
+    const parent = await bkFolder(), day = isoDay(new Date()), stamp = day + "_" + String(new Date().getHours()).padStart(2, "0") + String(new Date().getMinutes()).padStart(2, "0");
+    const x = await gUpload("Recruitment backup " + stamp + ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", bkWorkbook(), parent);
+    const f = await bkFull();
+    const j = await gUpload("Recruitment full backup " + stamp + f.ext, f.mime, f.blob, parent);
+    // keep only the last N days of backups
+    const keep = Date.now() - (+S.settings.gBackup.keepDays || 30) * 864e5;
+    try {
+      const list = await Desk.google.fetch("https://www.googleapis.com/drive/v3/files?q=" + encodeURIComponent("'" + parent + "' in parents and trashed = false") + "&fields=files(id,name,createdTime)&pageSize=1000");
+      for (const it of (list.files || [])) if (Date.parse(it.createdTime) < keep) await Desk.google.fetch("https://www.googleapis.com/drive/v3/files/" + it.id, { method: "DELETE" }).catch(() => {});
+    } catch {}
+    const archived = bkArchive(j.name);
+    Object.assign(st, { last: Date.now(), lastExcel: x.webViewLink || "", lastName: x.name, error: "", needLogin: false, archived: (st.archived || 0) + archived });
+    await save("backupState");
+    if (interactive) toast("Backup saved to Google Drive" + (archived ? "; " + archived + " old email texts moved out of the online database" : "") + ".", "ok");
+  } catch (e){
+    st.error = e.message; st.needLogin = !!e.needsLogin; await save("backupState");
+    if (interactive) toast("Backup failed: " + e.message, "err");
+  } finally { BK.running = false; renderTop(); if (page() === "settings" && !$("#modalBack").classList.contains("open")) renderAll(); }
+}
+function backupDue(){
+  const b = S.settings.gBackup; if (!b.on || !isAdminUser()) return false;
+  const last = S.backupState.last || 0, now = new Date();
+  return Date.now() - last > 20 * 3600e3 && now.getHours() >= (+b.hour || 0);
+}
+function backupCardHtml(){
+  const b = S.settings.gBackup, st = S.backupState, adm = isAdminUser() && can("admin");
+  const gReady = typeof Desk !== "undefined" && Desk.google && Desk.google.ready();
+  return '<div class="card"><h2>Automatic backup to Google Drive</h2><p class="muted small" style="margin:6px 0 12px">Once a day, everything is saved to your Google Drive: an <strong>Excel</strong> (candidates of all users, emails, WhatsApp, Mail Desk CVs) and a <strong>full backup file</strong>. CV files go to Drive through Mail Desk (Mail Desk settings → save CVs to Drive). Old email texts are then removed from the online database, so it stays small and the app opens fast.</p>' +
+    (!gReady ? '<div class="notice warn">Google is not set up yet. Open <a href="#/mdSettings">Mail Desk settings</a>, add the Google Client ID and click Connect Google.</div>' : '') +
+    (st.error ? '<div class="notice err">Last backup failed: ' + esc(st.error) + '</div>' : st.last ? '<div class="notice ok">Last backup: ' + fmtDT(st.last) + (st.lastExcel ? ' – <a href="' + esc(st.lastExcel) + '" target="_blank" rel="noopener">open Excel</a>' : '') + (st.folderLink ? ' · <a href="' + esc(st.folderLink) + '" target="_blank" rel="noopener">backup folder</a>' : '') + (st.archived ? ' · ' + st.archived.toLocaleString("en-IN") + ' old email texts moved to Drive so far' : '') + '</div>' : '') +
+    (adm ? '<label class="check" style="margin-bottom:10px"><input type="checkbox" id="bkOn" ' + (b.on ? "checked" : "") + '> Back up automatically every day</label>' +
+      '<div class="toolbar"><span>after</span><input type="number" id="bkHour" min="0" max="23" value="' + esc(b.hour) + '" style="width:70px"><span>:00 · keep backups for</span><input type="number" id="bkKeep" min="7" max="365" value="' + esc(b.keepDays) + '" style="width:80px"><span>days · keep full email text online for</span><input type="number" id="bkArch" min="0" max="365" value="' + esc(b.archiveDays) + '" style="width:80px"><span>days</span></div>' +
+      '<div class="toolbar" style="margin:0"><button class="btn primary" data-act="bkSave">Save</button><button class="btn" data-act="bkNow"' + (gReady ? "" : " disabled") + '>Back up now</button></div><p class="hint">Runs on the Admin\'s computer while the app is open. Google sign-in lasts one hour; if it has expired at backup time, a "Backup: sign in to Google" button appears at the top.</p>' : '<p class="small muted">Only the Admin sets this up.</p>') + '</div>';
+}
 function vSettings(){
   const s = S.settings, adm = can("admin"), dis = adm ? "" : " disabled";
   const f = (id, label, val, hint, type) => '<div class="field"><label for="' + id + '">' + label + '</label><input type="' + (type || "text") + '" id="' + id + '" value="' + esc(val) + '"' + dis + '>' + (hint ? '<div class="hint">' + hint + '</div>' : "") + '</div>';
@@ -2108,9 +2255,10 @@ function vSettings(){
     '<div class="field"><label>Redirect URI to register (type: Single-page application)</label><input type="text" readonly value="' + esc(redirectUri()) + '" onclick="this.select()"></div>' +
     '<div class="field"><label class="check"><input type="checkbox" id="sSim" ' + (s.simulate ? "checked" : "") + dis + '> Simulation mode: log emails without delivering them</label><div class="hint">Useful for training and trying the workflow. Addresses containing "fail" simulate a failed send.</div></div>' +
     (adm ? '<button class="btn primary" data-act="saveOutlook">Save connection settings</button>' : "") + '</div>' +
-    '<div class="card"><h2>Users & roles</h2><p class="muted small" style="margin:6px 0 12px">Roles apply to whoever connects Outlook in this browser. Admin: everything. HR Manager: templates, statuses and automation. HR Executive: uploads, sending and approvals. Viewer: read-only.</p>' +
-    (S.users.length ? '<div class="table-wrap"><table class="grid"><tbody>' + S.users.map((u, i) => '<tr><td>' + esc(u.email) + '</td><td><select data-act="userRole" data-i="' + i + '"' + dis + '>' + ROLES.map(r => '<option ' + (r === u.role ? "selected" : "") + '>' + r + '</option>').join("") + '</select></td><td>' + (adm ? '<button class="btn sm danger" data-act="userDel" data-i="' + i + '">Remove</button>' : "") + '</td></tr>').join("") + '</tbody></table></div>' : '<div class="notice warn">No users added yet, so everyone using this browser has Admin rights. Connect Outlook and add yourself as Admin first.</div>') +
-    (adm ? '<div class="toolbar" style="margin:12px 0 0"><input type="email" id="uEmail" class="grow" placeholder="name@company.com"><select id="uRole" style="width:auto">' + ROLES.map(r => '<option>' + r + '</option>').join("") + '</select><button class="btn" data-act="userAdd">Add user</button></div>' : "") + '</div>' +
+    '<div class="card" id="usersCard">' + (CLOUD.on ? usersCardHtml() : '<h2>Users & roles</h2><p class="muted small" style="margin:6px 0 12px">Roles apply to whoever connects Outlook in this browser. Admin: everything. HR Manager: templates, statuses and automation. HR Executive: uploads, sending and approvals. Viewer: read-only.</p>' +
+    (S.users.length ? '<div class="table-wrap"><table class="grid"><tbody>' + S.users.map((u, i) => '<tr><td>' + esc(u.email) + '</td><td><select data-act="userRole" data-i="' + i + '"' + dis + '>' + ROLES.map(r => '<option ' + (r === u.role ? "selected" : "") + '>' + r + '</option>').join("") + '</select></td><td>' + (adm ? '<button class="btn sm danger" data-act="userDel" data-i="' + i + '">Remove</button>' : "") + '</td></tr>').join("") + '</tbody></table></div>' : '<div class="notice warn">No users added yet, so everyone using this browser has Admin rights.</div>') +
+    (adm ? '<div class="toolbar" style="margin:12px 0 0"><input type="email" id="uEmail" class="grow" placeholder="name@company.com"><select id="uRole" style="width:auto">' + ROLES.map(r => '<option>' + r + '</option>').join("") + '</select><button class="btn" data-act="userAdd">Add user</button></div>' : "")) + '</div>' +
+    '<div id="bkCard">' + backupCardHtml() + '</div>' +
     '<div class="card"><h2>Shared data</h2>' + (CLOUD.on ? '<p class="muted small" style="margin:6px 0 12px">Candidates, templates, history and the email log are stored in your Supabase database, so every HR computer sees the same data. Signed in as <strong>' + esc(myEmail()) + '</strong>. ' + esc(senderText()) + '</p>' +
       '<div class="table-wrap" style="margin-bottom:12px"><table class="grid"><tbody>' +
       [["Candidates", Object.keys(S.candidates).length], ["Emails in the log", S.log.length], ["Templates", S.templates.length], ["Attachments", Object.keys(S.files).length], ["Replies", (S.replies || []).length], ["Users & roles", S.users.length]].map(([l, n]) => '<tr><td>' + l + '</td><td style="text-align:right"><strong>' + n.toLocaleString("en-IN") + '</strong></td></tr>').join("") +
@@ -2178,7 +2326,7 @@ const ACT = {
   },
   signOut: async () => { if (CLOUD.pending.size){ await cloudPush(); } await CLOUD.sb.auth.signOut(); location.reload(); },
   takeSender: async () => { if (!outlookReady()){ toast("Connect Outlook on this computer first.", "err"); return; } PC.noSend = false; savePC(); await senderHeartbeat(true); toast(isSender() ? "This computer now sends the emails." : "Could not switch; try again.", isSender() ? "ok" : "err"); runQueue(); renderAll(); },
-  saveBatch: async () => { if (!guard("configure")) return; const s = S.settings; s.batchEnabled = $("#bOn").checked; s.batchSize = Math.max(1, Math.min(500, +$("#bSize").value || 200)); s.batchMinutes = Math.max(1, Math.min(120, +$("#bMin").value || 5)); s.dailyCap = Math.max(1, Math.min(10000, +$("#bCap").value || 10000)); await save("settings"); toast("Sending speed saved: " + s.batchSize + " every " + s.batchMinutes + " min.", "ok"); renderAll(); },
+  saveBatch: async () => { if (!guard("configure")) return; const s = S.settings; s.batchEnabled = $("#bOn").checked; s.batchSize = Math.max(1, Math.min(500, +$("#bSize").value || 200)); s.batchMinutes = Math.max(1, Math.min(120, +$("#bMin").value || 5)); s.dailyCap = Math.max(1, Math.min(10000, +$("#bCap").value || 10000)); s.saveSent = $("#bSent").checked; await save("settings"); toast("Sending speed saved: " + s.batchSize + " every " + s.batchMinutes + " min.", "ok"); renderAll(); },
   qPause: async () => { S.queueCtl = { paused: true, by: myEmail(), at: Date.now() }; await save("queueCtl"); if (CLOUD.on) await cloudPush(); toast("Sending paused. The current email finishes, then it stops."); renderQueueStatus(); renderTop(); },
   qResume: async () => { S.queueCtl = { paused: false, by: myEmail(), at: Date.now() }; await save("queueCtl"); toast("Sending resumed.", "ok"); renderQueueStatus(); runQueue(); },
   qNow: async () => { S.queueState.windowStart = 0; S.queueState.windowCount = 0; S.queueState.holdUntil = 0; await save("queueState"); runQueue(); },
@@ -2417,6 +2565,38 @@ const ACT = {
   saveCompany: async () => { if (!guard("admin")) return; const s = S.settings; s.companyName = $("#sCompany").value.trim(); s.senderName = $("#sSender").value.trim(); s.hrName = $("#sHrName").value.trim(); s.hrMobile = $("#sHrMobile").value.trim(); s.hrEmail = $("#sHrEmail").value.trim(); s.address = $("#sAddress").value.trim(); s.signature = $("#sSig").value; await save("settings"); toast("Company details saved.", "ok"); renderAll(); },
   logoReset: async () => { S.settings.logo = LOGO_DEFAULT; await save("settings"); renderAll(); },
   saveOutlook: async () => { if (!guard("admin")) return; const s = S.settings; const changed = s.clientId !== $("#sClient").value.trim() || s.tenant !== ($("#sTenant").value.trim() || "common"); s.clientId = $("#sClient").value.trim(); s.tenant = $("#sTenant").value.trim() || "common"; s.simulate = $("#sSim").checked; if (!s.simulate && (changed || s.testWasSim)){ s.testPassed = false; if (s.mode === "auto"){ s.mode = "approval"; toast("Approval mode is back on. Send a real test email before using Auto mode.", ""); } } await save("settings"); await initMsal(); toast("Connection settings saved." + (!s.simulate && !account ? " Now click Connect Outlook." : ""), "ok"); renderAll(); },
+  bkSave: async () => { if (!guard("admin")) return; const b = S.settings.gBackup; b.on = $("#bkOn").checked; b.hour = Math.max(0, Math.min(23, +$("#bkHour").value || 0)); b.keepDays = Math.max(7, Math.min(365, +$("#bkKeep").value || 30)); b.archiveDays = Math.max(0, Math.min(365, +$("#bkArch").value || 0)); await save("settings"); toast("Backup settings saved.", "ok"); renderAll(); },
+  bkNow: () => runBackup(true),
+  genPass: () => { const c = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"; let p = ""; const a = new Uint32Array(10); crypto.getRandomValues(a); a.forEach(n => p += c[n % c.length]); $("#nuPass").value = p + "@" + (10 + (a[0] % 90)); },
+  uCreate: async () => {
+    if (!isAdminUser()) return;
+    const body = { action: "create", name: $("#nuName").value.trim(), email: $("#nuEmail").value.trim(), password: $("#nuPass").value, code: $("#nuCode").value.trim(), role: $("#nuRole").value };
+    try {
+      const j = await apiUsers(body);
+      UI.usersList = [...(UI.usersList || []), j.user];
+      UI.newCred = { name: body.name, email: j.user.email, text: "Recruitment Mailer\nLink: " + location.origin + "\nEmail: " + j.user.email + "\nPassword: " + body.password + "\n\nAfter signing in, click Connect Outlook with your own mail ID." };
+      toast("User created.", "ok");
+    } catch (e){ toast(e.message, "err"); }
+    const el = $("#usersCard"); if (el) el.innerHTML = usersCardHtml();
+  },
+  copyCred: () => { const t = $("#credText").textContent; (navigator.clipboard ? navigator.clipboard.writeText(t) : Promise.reject()).then(() => toast("Copied.", "ok")).catch(() => toast("Select the text and press Ctrl+C.")); },
+  hideCred: () => { UI.newCred = null; const el = $("#usersCard"); if (el) el.innerHTML = usersCardHtml(); },
+  uPass: async d => {
+    const p = prompt("New password for this user (at least 8 characters):"); if (!p) return;
+    try { await apiUsers({ action: "update", id: d.id, password: p }); const u = (UI.usersList || []).find(x => x.id === d.id); UI.newCred = { name: u && u.name, email: u && u.email, text: "Recruitment Mailer\nLink: " + location.origin + "\nEmail: " + (u ? u.email : "") + "\nNew password: " + p }; toast("Password changed.", "ok"); } catch (e){ toast(e.message, "err"); }
+    const el = $("#usersCard"); if (el) el.innerHTML = usersCardHtml();
+  },
+  uDisable: async d => {
+    const on = d.on === "1"; if (on && !confirm("Disable this user? They can no longer sign in. Their data stays.")) return;
+    try { const j = await apiUsers({ action: "update", id: d.id, disabled: on }); UI.usersList = UI.usersList.map(x => x.id === d.id ? j.user : x); toast(on ? "User disabled." : "User enabled.", "ok"); } catch (e){ toast(e.message, "err"); }
+    const el = $("#usersCard"); if (el) el.innerHTML = usersCardHtml();
+  },
+  uDelete: async d => {
+    const u = (UI.usersList || []).find(x => x.id === d.id);
+    if (prompt("Delete the sign-in of " + (u ? u.email : "this user") + "? Their candidates and emails stay in the database (Admin can still see them). Type DELETE to confirm.") !== "DELETE") return;
+    try { await apiUsers({ action: "delete", id: d.id }); UI.usersList = UI.usersList.filter(x => x.id !== d.id); toast("User deleted.", "ok"); } catch (e){ toast(e.message, "err"); }
+    const el = $("#usersCard"); if (el) el.innerHTML = usersCardHtml();
+  },
   userAdd: async () => { if (!guard("admin")) return; const em = $("#uEmail").value.trim().toLowerCase(), role = $("#uRole").value; if (!validEmail(em)){ toast("Enter a valid email address.", "err"); return; }
     const me = myEmail();
     if (!S.users.length){ if (!me){ toast((CLOUD.on ? "Sign in" : "Connect Outlook") + " first, so your own account can be added as Admin.", "err"); return; } if (em !== me || role !== "Admin"){ S.users.push({ email: me, role: "Admin" }); toast("Added you (" + me + ") as Admin first.", "ok"); } }
@@ -2446,6 +2626,8 @@ document.addEventListener("change", ev => {
   if (ev.target.id === "candAll"){ UI.selAllMatch = false; $$(".csel").forEach(c => c.checked = ev.target.checked); updateSelInfo(); }
   if (ev.target.classList && ev.target.classList.contains("csel")){ if (!ev.target.checked) UI.selAllMatch = false; updateSelInfo(); }
   if (ev.target.name === "upMode"){ $$('input[name="upMode"]').forEach(r => r.closest(".mode-opt").classList.toggle("on", r.checked)); }
+  if (ev.target.dataset && ev.target.dataset.act === "uRoleSet"){ apiUsers({ action: "update", id: ev.target.dataset.id, role: ev.target.value }).then(j => { UI.usersList = UI.usersList.map(x => x.id === j.user.id ? j.user : x); toast("Role changed. It applies the next time they sign in.", "ok"); }).catch(e => toast(e.message, "err")); }
+  if (ev.target.id === "candOwner"){ UI.candOwner = ev.target.value; renderCandRows(); }
   if (ev.target.id === "replyList"){ UI.replyList = ev.target.value; renderAll(); }
   if (ev.target.id === "candList"){ UI.candList = ev.target.value; renderCandRows(); }
   if (ev.target.id === "candStatus"){ UI.candStatus = ev.target.value; renderCandRows(); }
@@ -2781,16 +2963,74 @@ const DDB = (() => {
 
 let MAILS = [];                      // all processed mails (candidates + skipped)
 const byId = new Map();
+/* ---- shared database: each user's inbox mails are saved online under their account; Admin sees everyone's ---- */
+const MD = { rowOf: new Map(), pending: new Set(), timer: null, pushing: false, last: null };
+const mdOwner = (m) => m._ownerUid || (CLOUD.on ? '' : 'local');
+const mdMine = (m) => !CLOUD.on || mdOwner(m) === myUid();
+const mdSlim = (m) => { const o = Object.assign({}, m); delete o.cvText; if (o.bodyText) o.bodyText = String(o.bodyText).slice(0, 1500); return o; };
+function mdQueue(m) { if (!CLOUD.on || DEMO) return; MD.pending.add(m.id); clearTimeout(MD.timer); MD.timer = setTimeout(mdPush, 1500); }
+async function mdPush() {
+  if (!CLOUD.on || MD.pushing) { clearTimeout(MD.timer); MD.timer = setTimeout(mdPush, 2000); return; }
+  const ids = [...MD.pending]; MD.pending.clear(); if (!ids.length) return;
+  MD.pushing = true;
+  try {
+    const rows = ids.map((id) => byId.get(id)).filter(Boolean).map((m) => ({ id: MD.rowOf.get(m.id) || (myUid() + ':' + m.id), data: mdSlim(m) }));
+    for (let i = 0; i < rows.length; i += 100) {
+      const { error } = await CLOUD.sb.from('wc_mail').upsert(rows.slice(i, i + 100));
+      if (error) throw error;
+      rows.slice(i, i + 100).forEach((r) => MD.rowOf.set(r.data.id, r.id));
+    }
+  } catch (e) { ids.forEach((id) => MD.pending.add(id)); console.warn('Mail Desk sync', e); clearTimeout(MD.timer); MD.timer = setTimeout(mdPush, 20000); }
+  finally { MD.pushing = false; }
+}
+async function mdPull(full) {
+  if (!CLOUD.on || DEMO) return false;
+  let changed = false, from = 0;
+  for (;;) {
+    let q = CLOUD.sb.from('wc_mail').select('id,data,owner,updated_at').order('updated_at', { ascending: true }).range(from, from + 999);
+    if (!full && MD.last) q = q.gt('updated_at', MD.last);
+    const { data, error } = await q; if (error) throw error;
+    for (const r of data) {
+      if (!MD.last || r.updated_at > MD.last) MD.last = r.updated_at;
+      const m = r.data; if (!m || !m.id) continue;
+      m._ownerUid = r.owner; MD.rowOf.set(m.id, r.id);
+      const loc = byId.get(m.id);
+      if (loc && MD.pending.has(m.id)) continue;   // our own unsaved change wins
+      if (loc && String(loc.changedAt || '') > String(m.changedAt || '')) continue;
+      if (loc && loc.cvText && !m.cvText) m.cvText = loc.cvText;
+      if (loc) MAILS[MAILS.indexOf(loc)] = m; else MAILS.push(m);
+      byId.set(m.id, m); changed = true;
+      if (r.owner === myUid()) DDB.put('mails', m).catch(() => {});
+    }
+    if (data.length < 1000) break; from += 1000;
+  }
+  return changed;
+}
 async function loadAll() {
   MAILS = await DDB.all('mails');
+  if (CLOUD.on) {
+    // mails on this computer from before shared data: they belong to whoever is signed in now only if Admin
+    for (const m of MAILS) if (!m._ownerUid && isAdminUser()) { m._ownerUid = myUid(); }
+    MAILS = MAILS.filter((m) => m._ownerUid === myUid() || isAdminUser() && m._ownerUid);
+  }
   byId.clear(); MAILS.forEach((m) => byId.set(m.id, m));
+  if (CLOUD.on) {
+    try {
+      await mdPull(true);
+      if (!isAdminUser()) { MAILS = MAILS.filter((m) => m._ownerUid === myUid()); byId.clear(); MAILS.forEach((m) => byId.set(m.id, m)); }
+      for (const m of MAILS) if (m._ownerUid === myUid() && !MD.rowOf.has(m.id)) MD.pending.add(m.id);   // first time: upload this computer's mails
+      if (MD.pending.size) mdPush();
+    } catch (e) { console.warn('Mail Desk could not load shared mails', e); }
+  }
 }
 async function saveMail(m, { touch = true } = {}) {
   if (touch) m.changedAt = new Date().toISOString();
+  if (CLOUD.on && !m._ownerUid) m._ownerUid = myUid();
   if (!byId.has(m.id)) MAILS.push(m);
   else MAILS[MAILS.findIndex((x) => x.id === m.id)] = m;
   byId.set(m.id, m);
-  if (!DEMO) await DDB.put('mails', m);
+  if (!DEMO && mdMine(m)) await DDB.put('mails', m);
+  mdQueue(m);
 }
 const candidates = () => MAILS.filter((m) => m.isCandidate && !m.dupOf).sort((a, b) => String(b.received).localeCompare(String(a.received)));
 const skipped = () => MAILS.filter((m) => !m.isCandidate).sort((a, b) => String(b.received).localeCompare(String(a.received)));
@@ -2821,7 +3061,7 @@ async function dedupe() {
   const list = MAILS.filter((m) => m.isCandidate).sort((a, b) => String(a.received).localeCompare(String(b.received)));
   const groupOf = new Map(), groups = [];
   for (const m of list) {
-    const keys = personKeys(m);
+    const keys = personKeys(m).map((k) => mdOwner(m) + '|' + k);
     let g = keys.map((k) => groupOf.get(k)).find(Boolean);
     if (!g) { g = []; groups.push(g); }
     g.push(m); keys.forEach((k) => groupOf.set(k, g));
@@ -3706,7 +3946,7 @@ async function linkAll({ loud = false } = {}) {
   if (!can('operate')) return 0;
   linking = true;
   try {
-    const todo = candidates().filter((m) => !m.refId).reverse();   // oldest first, so reference numbers follow arrival order
+    const todo = candidates().filter((m) => !m.refId && mdMine(m)).reverse();   // oldest first, so reference numbers follow arrival order
     if (!todo.length) { if (loud) dToast('Every candidate already has a Candidate ID.'); return 0; }
     const colsChanged = ensureCols();
     const since = deskSince(), groups = { oldMail: [], newMail: [], upload: [] }, filled = [];
@@ -3775,11 +4015,47 @@ async function boot() {
   await linkAll();
   dRender(); setupAuto();
   if (account && DS.autoOn && (!CLOUD.on || isSender())) setTimeout(() => scan({ quiet: true }), 6000);
+  if (CLOUD.on) setInterval(async () => { try { if (await mdPull(false)) { await dedupe(); if (isPage()) dRender(); } } catch {} }, 60000);
 }
 
-return { boot, render: dRender, counts, isPage, scan: () => scan(), addCvFiles };
+return { boot, render: dRender, counts, isPage, scan: () => scan(), addCvFiles,
+  google: { fetch: gFetch, signIn: () => gSignIn(!DS.gConnected), valid: gValid, ready: () => !!DS.gClientId, connected: () => !!DS.gConnected },
+  mails: () => MAILS.map(mdSlim), sheetRows: () => candidates().map(sheetRow) };
 })();
 /* ===== HR MAIL DESK END ===== */
+
+/* ---------- "New version available → Update" ----------
+   GitHub → Vercel builds the new version next to the old one and switches over only when it is ready,
+   so the tool never goes offline. Pages that are already open keep the old version until someone clicks Update. */
+const UPD = { tag: null, shown: false, snooze: 0 };
+async function versionTag(){
+  try {
+    const r = await fetch(location.pathname.replace(/[^/]*$/, "") + "index.html?v=" + Date.now(), { method: "HEAD", cache: "no-store" });
+    if (!r.ok) return null;
+    return r.headers.get("etag") || ((r.headers.get("last-modified") || "") + "|" + (r.headers.get("content-length") || "")) || null;
+  } catch { return null; }
+}
+async function checkUpdate(){
+  const t = await versionTag(); if (!t) return;
+  if (!UPD.tag){ UPD.tag = t; return; }
+  if (t !== UPD.tag && !UPD.shown && Date.now() > UPD.snooze) showUpdate();
+}
+function showUpdate(){
+  UPD.shown = true;
+  const d = document.createElement("div"); d.className = "upd"; d.id = "updBar"; d.setAttribute("role", "status");
+  d.innerHTML = '<span>A new version of the tool is ready.</span><button class="btn sm" id="updGo">Update now</button><button class="btn sm ghost" id="updLater">Later</button>';
+  document.body.appendChild(d);
+  $("#updLater").onclick = () => { d.remove(); UPD.shown = false; UPD.snooze = Date.now() + 30 * 60000; };
+  $("#updGo").onclick = applyUpdate;
+}
+async function applyUpdate(){
+  const b = $("#updGo"); if (b){ b.disabled = true; b.textContent = "Saving…"; }
+  // never cut a send in half: wait for the current email / WhatsApp to finish
+  for (let i = 0; i < 120 && ((typeof Q !== "undefined" && Q.running) || (typeof QW !== "undefined" && QW.running) || UI.busy); i++){ if (b) b.textContent = "Finishing the current send…"; UI.updating = true; await sleep(1000); }
+  try { if (CLOUD.on){ await cloudPush(); } } catch {}
+  try { sessionStorage.setItem("wc-updated", "1"); } catch {}
+  location.reload();
+}
 
 /* ---------- start ---------- */
 (async function start(){
@@ -3808,6 +4084,10 @@ return { boot, render: dRender, counts, isPage, scan: () => scan(), addCvFiles }
   if (CLOUD.on){
     await senderHeartbeat(); setInterval(() => senderHeartbeat(), 30 * 1000);
     setInterval(pollQueueCtl, 8 * 1000);
+    checkUpdate(); setInterval(checkUpdate, 3 * 60 * 1000);
+    try { if (sessionStorage.getItem("wc-updated")){ sessionStorage.removeItem("wc-updated"); setTimeout(() => toast("Updated to the latest version.", "ok"), 800); } } catch {}
+    setInterval(() => { if (backupDue()) runBackup(false); }, 15 * 60 * 1000); setTimeout(() => { if (backupDue()) runBackup(false); }, 90 * 1000);
+    if (isAdminUser()) apiUsers({ action: "list" }).then(j => { UI.usersList = j.users || []; UI.usersLoaded = true; if (page() === "candidates") renderAll(); }).catch(() => {});
     setInterval(async () => {
       if (await cloudPull(false)){
         const typing = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
