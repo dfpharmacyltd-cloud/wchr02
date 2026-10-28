@@ -1,169 +1,90 @@
-# WESTCOAST AI Procurement Agent — v2
+# West-Coast Recruitment Mailer
 
-Type an API name once → get one clean list of manufacturers with **email, phone and WhatsApp number** → test the message on yourself → send to everyone by **Outlook email** and **WhatsApp (WATI)** in one click.
+Candidate Excel → change detection → status template → Outlook → email status and log.
 
----
+## Files
 
-## What's new in v2
-
-| | |
+| File | Purpose |
 |---|---|
-| **Find suppliers (home page)** | One form: API, quantity, pharmacopoeia, country, how many. Runs Apollo + web search, reads each company's own website (home + contact/about pages) for emails, phones and WhatsApp links, then shows a numbered list. |
-| **Country lock** | "Only companies in the chosen country" (default India) keeps a company only with proof: `.in` domain, `+91` phone, an Indian address/state on its website, or Apollo's country. Others are listed separately with the reason. |
-| **Missing emails** | First from the company website (incl. Cloudflare-protected emails), then optionally Apollo (uses credits, asks first). Emails are never guessed. |
-| **Free Google option** | Google Gemini (free tier, Google Search grounding) and Serper (Google results). **Auto** mode tries Claude → Gemini → Serper, so if one API fails the next one works. AI extraction also falls back Claude → Gemini. |
-| **Outlook** | Each user connects their own Outlook (Microsoft Graph). Drafts are created in Outlook, or sent directly; supplier replies sync back automatically. |
-| **WhatsApp** | WATI approved templates, smart field mapping, test on your own number first, then one-click send. |
-| **Test first** | "Send all" stays locked until the test email / WhatsApp has gone to you and you tick "the text is correct". |
-| **Users** | Login for everyone. Admin adds users (admin / procurement / viewer). All users see the same data from anywhere. |
-| **Backups** | Every result is saved in the database instantly; plus "Excel (all data)", JSON backup, server snapshots (last 14) and a daily automatic snapshot. |
-| **Light UI** | New light design (dark mode in Settings). |
+| `index.html` | The complete app (single file) |
+| `redirect.html` | Blank page Microsoft sign-in returns to. Keep it next to `index.html` |
+| `xlsx.full.min.js` | Excel reader, served from your own site so office firewalls can't block it |
+| `msal-browser.min.js` | Microsoft sign-in library, served from your own site |
+| `supabase.min.js` | Shared-database library, served from your own site |
+| `config.js` | Your Supabase project URL and public key (shared data on every computer) |
+| `supabase_setup.sql` | Run once in Supabase to create the shared tables (not uploaded to the site) |
+| `Sample_1_start.xlsx` | Three test candidates in the bio-data list format |
+| `Sample_2_update.xlsx` | Same people with status and interview changes, plus one new applicant |
 
----
+## 1. Deploy (Vercel, 2 minutes)
 
-## Purchase inquiries with vendor quotation links (v2.3)
+1. Put `index.html`, `redirect.html`, `xlsx.full.min.js` and `msal-browser.min.js` together in one folder (or GitHub repo).
+2. In Vercel: **Add New → Project**, import the folder/repo, framework preset **Other**, no build command. Deploy.
+3. Note the URL, for example `https://westcoast-recruitment.vercel.app`.
 
-* **Item master** — products / materials with code, make, quantity, UOM, specification, packing, artwork files (Google Drive) and approved vendors.
-* **Vendor master** — upload your vendor Excel (or add one by one).
-* **New inquiry** (3 steps) — choose RM / PM → add items (picked from Item master, files attached automatically, more items with *+ Add another item*, or copy a previous inquiry) → delivery time/location, common attachments, vendors (item vendors pre-selected) → review, test email to yourself → **Create inquiry & send**. Code format `INQ-2026-10-15`.
-* Every vendor receives an email (from your Outlook, CC kcp@ / parth@) with the item table and a **personal link**. On that page the vendor fills Rate, Discount, Final/Net rate, Tax, MRP, Delivery, Packing, Freight, Insurance, Payment terms, Validity, Remarks and submits **once**. They get a "Quotation Received" email automatically.
-* **Inquiry management** — per item, all vendor quotes side by side. The **lowest rate row is highlighted in light green** with a "Lowest rate" badge; others show how much higher (%). Toggle *Compare including tax*. **Finalize** sends the "Quotation Finalized" email with your remarks (e.g. FINAL PRICE MAKE RS.70). Copy link / resend reminder for vendors who have not replied. Excel export of the comparison.
-* Net rate = Final/Net rate if the vendor filled it, otherwise Rate − Discount %. "With tax" = net × (1 + Tax %).
+Any static host works (Netlify, IIS, an internal web server). It must be served over **https** (or `http://localhost` for testing); Microsoft sign-in does not work from a file opened directly from disk.
 
-## Google Drive (cloud copy of everything)
+## 2. Register the app with Microsoft (one time, needs an M365 admin)
 
-1. console.cloud.google.com → create a project → **APIs & Services → Library → Google Drive API → Enable**.
-2. **OAuth consent screen** → User type *External* (or *Internal* for Google Workspace) → app name "WESTCOAST Procurement" → add scope `.../auth/drive.file` → **Publish app** (status *In production*). `drive.file` is a non-sensitive scope, so no Google review is needed; in *Testing* status Google expires the connection every 7 days.
-3. **Credentials → Create credentials → OAuth client ID → Web application** → Authorized redirect URI: `https://purchasea1.vercel.app/api/gdrive/callback`.
-4. Vercel variables: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` (and `APP_URL`) → Redeploy.
-5. App (admin) → **Integrations → Connect Google Drive** → choose the company Google account → Allow.
-   The app creates **WESTCOAST Procurement / Backups** and **/ Inquiry files** and can only see files it created.
-* Attachments uploaded in Item master / New inquiry go to *Inquiry files*; vendors get a view link.
-* **Backups → Back up to Google Drive now** saves JSON + Excel. Automatic: when the app is opened and after every important action (import, inquiry sent, finalize…) — at most every 2 hours — plus twice a day by Vercel Cron (about 1:00 PM and 2:00 AM India time, needs `CRON_SECRET`).
+1. Go to **entra.microsoft.com → Applications → App registrations → New registration**.
+2. Name: `West-Coast Recruitment Mailer`. Supported accounts: **Accounts in this organizational directory only**.
+3. Redirect URI: platform **Single-page application (SPA)**, value `https://<your-site>/redirect.html` (the app's Settings page shows the exact value to copy).
+4. Register. Copy the **Application (client) ID** and **Directory (tenant) ID**.
+5. **API permissions → Add → Microsoft Graph → Delegated**: `User.Read` and `Mail.Send`. Click **Grant admin consent**.
 
-## Gmail (send from Gmail)
-Uses the same Google Cloud project as Drive:
-1. Google Cloud → **Clients** → your Web client → add redirect URI `https://purchasea1.vercel.app/api/gmail/callback` → Save.
-2. **Data access → Add or remove scopes** → add `.../auth/gmail.send`, `.../auth/userinfo.email`, `openid` → Update → Save. `gmail.send` is a *sensitive* scope: until Google verifies the app, users see "Google hasn't verified this app" → **Advanced → Go to WESTCOAST Procurement** (fine for internal use, max 100 users).
-3. App → **Integrations → Connect Gmail** (each user connects their own Gmail).
-The tool can only **send** from Gmail; it cannot read Gmail, so replies to Gmail are not counted automatically (log them in Supplier replies, or send via Outlook).
+No client secret is created or needed. The app uses the OAuth 2.0 authorization-code flow with PKCE; the HR user signs in on Microsoft's own page, and the app only ever receives a short-lived token limited to reading the profile and sending mail as that user. Passwords are never seen or stored.
 
-## Sending options
-* Outlook or Gmail per send; **BCC** field; mode **Separate email to each vendor** or **One email, all vendors in BCC** (max 50 per email).
-* Attachments up to **100 MB per file** (uploaded 3 at a time in 4 MB chunks). Files that would push an email over ~20 MB (Outlook) / ~24 MB (Gmail) are sent as Google Drive download links automatically.
-* **Sent so far** panel: per template — sent, failed (with reason, *Select failed* to retry), replied, waiting, reply rate. Same table across all requests in RFQ drafts → Templates.
+## 3. First run
 
-## Local backup on your PC
-**Backups → Choose backup folder** (Chrome / Edge on a PC) → pick e.g. `D:\Westcoast Backup`. A JSON + Excel copy is written there immediately, and again automatically once a day when you open the app on that PC. **Download** buttons still work everywhere.
+1. Open the site → **Settings** → paste the client ID and tenant ID → untick **Simulation mode** → **Save connection settings**.
+2. Click **Connect Outlook** in the sidebar and sign in with the HR mailbox.
+3. **Settings → Users & roles**: add yourself as Admin, then add colleagues (HR Manager, HR Executive, Viewer).
+4. Fill in HR name, email, mobile and signature.
+5. **Upload Excel**: upload the full bio-data list with **Import as starting point** ticked (the default for the first upload), so the existing ~2,250 people are not emailed. From then on only new applicants and status changes send emails.
+6. **Statuses & automation → Send test email** to your own address. After it succeeds you can switch to **Auto mode**.
 
-## Miscellaneous and Logistics (v2.8)
-* Departments are now **RM, PM, MISC, LOG** (Users → Department; "All departments" can switch at the top).
-* New inquiry types: Raw materials, Packing materials, **Miscellaneous**, **Logistics – Sea Freight**, **Logistics – Air Freight**.
-* Logistics: enter shipment details (buyer, destination, ports, cartons, gross / volume weight, dimensions, CBM…), choose INR or USD, pick forwarders (tag them "Air freight" / "Sea freight" in the Vendor master Material column so they are suggested). Forwarders get the short link; their form adds up the **Total** live (air: total freight or rate × chargeable weight + charges; sea: ocean freight + charges). The lowest total is highlighted; Finalize / Excel work as for materials.
+Tip: leave Simulation mode on first and run the two sample files through the full flow. Addresses containing `fail` simulate a failed send so you can see the retry path.
 
-## PM / RM departments (v2.2)
+## Shared data on every computer (Supabase)
 
-* Every user has a **Department**: **PM** (Packing Material), **RM** (Raw Material) or **Both**. Set it in *Users*.
-* PM users only ever see and change PM data; RM users only RM. The server enforces this — not just the screen.
-* Users with "Both" (e.g. the admin) switch with the **RM | PM** buttons at the top right.
-* Request numbers: `PM-2026-0001`, `RM-2026-0001`. Existing older data counts as RM.
-* **My suppliers (upload)**: upload your company's supplier Excel/CSV (any column names — the tool detects them, you can correct the mapping). Filter by material, state, city → select → **Send one inquiry** → test on yourself → send to all. Replies appear on the same page (*Check Outlook for replies*).
-* PM gets its own email template ("Standard PM RFQ" with item, quantity, specification); RM keeps the API template. Placeholders `{{MATERIAL}}` and `{{SPECIFICATION}}` are available.
+1. Go to **supabase.com** → **New project** (name `westcoast-recruitment`, region Mumbai, any strong database password).
+2. **SQL Editor → New query** → paste all of `supabase_setup.sql` → **Run**.
+3. **Authentication → Sign In / Providers** → turn **off** "Allow new users to sign up".
+4. **Authentication → Users → Add user → Create new user**: one email + password per HR person, tick **Auto Confirm User**.
+5. **Project Settings → API**: copy the **Project URL** and the **anon public** key into `config.js`, then upload `config.js` with the other files to GitHub.
+6. On the computer that already has the data: open the app and sign in. Its data is uploaded automatically.
+7. On every other computer: open the app and sign in. The same data appears.
 
-## Store everything in your own MySQL (phpMyAdmin)
+The anon key is designed to be public; the database only answers to signed-in HR users (row-level security in the SQL file).
 
-`php-bridge/wc-bridge.php` is a single PHP file you upload to your existing PHP hosting (cPanel, Hostinger, etc.). The app saves every record through it into MySQL, so you see all data in phpMyAdmin. Works with any shared hosting — no "Remote MySQL" needed.
+## Your file format (bio-data list)
 
-1. Hosting panel → **MySQL Databases**: create a database + user, give the user ALL PRIVILEGES.
-2. Open `wc-bridge.php`, fill in the 5 lines at the top (DB name, user, password, a 40+ character `$BRIDGE_KEY`).
-3. Upload it with File Manager to `public_html/` — give it a hard-to-guess name, e.g. `wc-bridge-x7k2.php`. The site must use **https**.
-4. Vercel variables: `PHP_BRIDGE_URL=https://yourdomain.com/wc-bridge-x7k2.php`, `PHP_BRIDGE_KEY=` same key. Remove `SUPABASE_URL` (or leave it — the bridge wins). Redeploy.
-5. phpMyAdmin → your database: table `wc_records` holds everything; easy views `v_suppliers`, `v_contacts`, `v_purchase_requests`, `v_messages`, `v_replies`, `v_audit`.
-Moving from Supabase: Backups → JSON backup first, switch, then Backups → Restore.
-Free hosts with bot protection (e.g. InfinityFree) block server-to-server calls — use real hosting.
+The export works exactly as it comes, .csv or .xlsx:
+`Post, Qualification, Candidate Name, Mobile No, Email Id, City, Experience, Remark, Entry By, Entry Date`
 
-## Deploy on Vercel (step by step)
+- Only **Candidate Name** and **Email Id** are required.
+- **Candidate ID** is created automatically (WC00001, WC00002…) and is tied to the email address (or mobile if there is no email), so the next export matches the same people.
+- **No status column?** New people get the default status (Application Received) and its email. Change the default under Statuses & automation.
+- **Moving candidates forward:** Candidates page → tick people → **Change status of selected** (with interview date and time if needed). Or add `Candidate Status`, `Interview Date`, `Interview Time` columns to the file.
+- **Clean-up on upload:** extra text around emails is removed (`: name@gmail.com`, two emails in one cell, `gmail;.com`, stray spaces); +91 / leading 0 is removed from mobiles; a person listed more than once is kept once, using the latest Entry Date. Addresses that still can't be fixed are listed under the **Invalid or missing email** filter.
+- **Download updated Excel** uses the same headings (Post, Mobile No, Email Id, Remark…) plus the ID, status and email columns.
+- {{Position}} is the Post (several posts are joined with commas). {{Qualification}}, {{Experience}}, {{City}}, {{Entry_Date}} work in templates. {{Location}} uses the interview venue from settings when the file has no Location column.
 
-### 1. Supabase table (one time)
-Supabase → SQL Editor → run:
-```sql
-create table if not exists public.wc_records (
-  coll text not null, id text not null, doc jsonb not null,
-  updated_at timestamptz not null default now(),
-  primary key (coll, id)
-);
-alter table public.wc_records enable row level security;
-```
-(Already created it for v1? Nothing to do — v2 uses the same table.)
+## How change detection works
 
-### 2. Environment variables
-Vercel → Project → **Settings → Environment Variables**. Minimum:
+- Candidates are matched by **Candidate ID**. A new ID, or a changed **Candidate Status**, triggers an email; nothing else does.
+- Duplicate protection key: `Candidate ID + Status + Template` (reminders also include the interview date). Re-uploading the same file sends nothing. **Resend** in the Email log sends again on purpose.
+- Optional **Email Template** column: a template name here overrides the status template for that row. Leave it blank normally.
+- Columns not in the standard list are added automatically and usable as `{{Column_Name}}` variables.
+- After processing, **Download updated Excel** gives the file back with Email Sent, Email Sent Date/Time and Email Status filled in.
 
-| Name | Value |
-|---|---|
-| `SESSION_SECRET` | 32+ random characters |
-| `ADMIN_SETUP_KEY` | any secret word (used once to create the admin) |
-| `APP_URL` | `https://your-site.vercel.app` (no `/` at the end) |
-| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | from Supabase → Project Settings → API |
-| `GEMINI_API_KEY` | free from **aistudio.google.com → Get API key** |
+## Things to know
 
-Add the others from `.env.example` as you need them (Claude, Serper, Apollo, Outlook, WATI, `CRON_SECRET`).
-
-### 3. Deploy
-Push this folder to GitHub (replace the old files) → Vercel deploys. `server.js` is the entry Vercel uses.
-Settings → Functions → raise **Max Duration** if your plan allows (search + website reading can take 30–90 s).
-
-### 4. First login
-Open the site → **Create the administrator** (enter the setup key) → **Users → Add user** for the team.
-
----
-
-## Connect Outlook (Microsoft Entra, 10 minutes)
-
-1. portal.azure.com → **Microsoft Entra ID → App registrations → New registration**.
-   Name: `WESTCOAST Procurement`. Supported accounts: *this organization only* (or multi-tenant).
-   Redirect URI → **Web** → `https://your-site.vercel.app/api/outlook/callback`
-2. **Certificates & secrets → New client secret** → copy the **Value**.
-3. **API permissions → Add → Microsoft Graph → Delegated**: `User.Read`, `Mail.ReadWrite`, `Mail.Send`, `offline_access` → **Grant admin consent**.
-4. Vercel variables: `MS_CLIENT_ID` (Application ID), `MS_CLIENT_SECRET`, `MS_TENANT_ID` (Directory ID, or `common`), `APP_URL`. Redeploy.
-5. In the app: **Integrations → Connect Outlook** (each user connects their own mailbox).
-
-## Connect WhatsApp (WATI)
-1. WATI dashboard → **API Docs** → copy the **API Endpoint** (contains your tenant ID) and **Access Token**.
-2. Vercel variables: `WATI_API_ENDPOINT`, `WATI_ACCESS_TOKEN`. Redeploy.
-3. WATI → **Templates** → create an inquiry template (Utility or Marketing), e.g.
-   `Hello {{name}}, WESTCOAST PHARMACEUTICAL WORKS LTD. requires {{api}} ({{qty}}). Please share your best offer, COA and DMF status.`
-   Wait until WhatsApp approves it — only approved templates can be sent.
-4. In **Send inquiry** choose the template; fields are mapped automatically (change if needed).
-
-> WhatsApp rules: business-started messages must use an approved template, and recipients should have agreed to be contacted. Bulk messages to people who did not opt in can get the number restricted by WhatsApp. A "WhatsApp" number in the list is a mobile number found on the company's site — not proof it uses WhatsApp.
-
-## Other keys
-* **Claude**: `ANTHROPIC_API_KEY` (+ `ANTHROPIC_WORKSPACE_ID` if the key isn't workspace-scoped).
-* **Serper**: serper.dev → API key → `SERPER_API_KEY` (2,500 free searches).
-* **Apollo**: `APOLLO_API_KEY` (needs organization search, people search, bulk enrichment).
-* **Daily backup**: `CRON_SECRET` (vercel.json already schedules `/api/cron/snapshot` every night).
-
-## Run on a PC instead
-Node.js 20 → `start-windows.bat` (or `npm install && npm start`) → http://localhost:3000. Data is saved in `data/`; login secret is created automatically.
-
-## Security
-Passwords hashed (scrypt) · signed HttpOnly session cookies · roles enforced on the server · Outlook tokens encrypted (AES-256-GCM) · API keys only on the server · CSRF header check · strict CSP · SSRF-guarded website reader · audit log append-only and stamped by the server with the signed-in user · website/email text treated as untrusted (cannot approve suppliers or send mail).
-
-## Tests
-`npm test` — 13 server tests against **mock** providers (`test/mock-providers.js`): login/setup, roles, CSRF, Claude→Gemini fallback, invented-URL dropping, Serper marketplace filter, website email/phone/WhatsApp extraction (incl. Cloudflare emails, no fax/CAS false positives), India check, Outlook OAuth→draft→send→inbox, encrypted tokens, WATI templates/send, Apollo, snapshots/cron. A full browser run (find → send → reply sync → users → backups) was also done against the mocks. **Mocks are not proof the live APIs work** — use *Integrations → Run test* with real keys.
-
-## Feature status
-| Feature | Status |
-|---|---|
-| Login, users, roles | Implemented, tested |
-| Find suppliers (Apollo + web + website reader + country lock) | Implemented, tested with mocks |
-| Gemini / Serper / Claude search with automatic fallback | Implemented, tested with mocks — live needs keys |
-| Outlook connect, drafts, send, reply sync | Implemented, tested with mocks — live needs Entra app |
-| WhatsApp via WATI | Implemented, tested with mocks — live needs WATI + approved template |
-| Backups (Excel, JSON, snapshots, daily cron) | Implemented, tested |
-| Item master, multi-item inquiries, vendor quotation links, lowest-rate highlight, finalize emails | Implemented, tested (server + browser) |
-| Google Drive attachments + cloud backup, local folder backup | Implemented, tested with mocks — live needs Google OAuth client |
-| PM / RM departments, supplier-list upload, bulk inquiry, replies per inquiry | Implemented, tested (server + browser) |
-| MySQL / phpMyAdmin storage via PHP bridge | Implemented — full test suite + browser flow passed on MariaDB 10.11 / PHP 8.3 |
-| Delivery/read receipts for WhatsApp (WATI webhooks) | Not yet — status shows "accepted by WATI" |
+- **Shared data**: with `config.js` filled in, all data lives in Supabase and every HR computer sees the same candidates, templates and email log after signing in. Without it, data stays in one browser only.
+- **One sending computer**: only one computer sends at a time (the first open one with Outlook connected). Others can upload, change statuses and approve; their emails are sent by the sending computer. If it closes, another open computer with Outlook connected takes over within 2 minutes. **Settings → Shared data → Send emails from this computer** switches it by hand.
+- **Interview reminders** are sent by the open page. Keep the app open in a browser tab on the HR computer; if it was closed at the due time, overdue reminders go out when it next opens (if the interview hasn't happened).
+- **Roles** are enforced in the app for whoever is signed in to Outlook in that browser. They stop accidental changes; they are not a server-side security boundary.
+- **Attachments**: up to 3 MB total per email (Microsoft Graph limit for this sending method). Share larger files via a link.
+- **Sender name**: candidates see the mailbox's own display name from Microsoft 365. Ask your M365 admin to set it (for example "West-Coast HR") or use a shared HR mailbox account.
+- **Sending in batches** (Statuses & automation → Sending speed): default 200 emails every 5 minutes, with a daily stop limit. Emails wait in the sending queue (status *Queued*) and go out batch by batch; you can pause, resume or send the next batch now from the Queue page. Keep the page open while it sends; if it is closed, sending continues from where it stopped when you open it again.
+- **Outlook's limit**: Exchange Online accepts about 30 messages per minute per mailbox, so emails are spaced at least 2 seconds apart. 200 per batch therefore takes about 7 minutes; the next batch starts right after. For an exact 5-minute rhythm use 140 per batch. If Outlook still asks the app to slow down, the email stays queued and is retried automatically. Daily limit: 10,000 recipients per mailbox (your IT team may set it lower).
